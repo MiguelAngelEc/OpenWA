@@ -302,7 +302,9 @@ export class InfraController {
       if (config.engine) {
         envLines.push('# WhatsApp Engine');
         envLines.push(`ENGINE_HEADLESS=${config.engine.headless !== false ? 'true' : 'false'}`);
-        envLines.push(`ENGINE_SESSION_PATH=${config.engine.sessionDataPath || './data/sessions'}`);
+        // Must match the key configuration.ts reads; ENGINE_SESSION_PATH was
+        // never picked up, so a path set from the Dashboard was silently ignored.
+        envLines.push(`SESSION_DATA_PATH=${config.engine.sessionDataPath || './data/sessions'}`);
         envLines.push(`ENGINE_BROWSER_ARGS=${config.engine.browserArgs || '--no-sandbox --disable-gpu'}`);
         envLines.push('');
       }
