@@ -331,6 +331,32 @@ session state change, delivery receipt and QR refresh will hit your endpoint too
 { "url": "https://your-server.com/webhook", "events": ["message.received"] }
 ```
 
+### Measuring it yourself
+
+```bash
+npm run loadtest:inbound
+```
+
+Drives the real inbound path with a generated hour of traffic — contact
+statuses, channel posts, broadcast lists, group chatter and a handful of direct
+messages — with no account, no Chromium and no network. It reports how much
+base64 each configuration leaves in flight:
+
+```
+scenario      kept dropped files downloaded in payload retained  secs
+unfiltered     240       0   175     373 MB   497.4 MB     0 MB  0.57
+defaults        75     165    11    11.9 MB    15.9 MB     0 MB  0.01
+low-memory      15     225     5      10 MB    13.3 MB     0 MB  0.03
+no-media        15     225     0       0 MB       0 MB     0 MB     0
+```
+
+The gap between `downloaded` and `in payload` is the base64 overhead: 373 MB of
+files become 497 MB of string. `retained` is what survives a GC once the burst
+ends — it should stay near zero, and the script exits non-zero if it does not.
+
+Use it to check a config change before deploying it, or as a regression guard:
+the numbers are deterministic, so a jump means something actually changed.
+
 ### The floor these settings cannot lower
 
 Every active session runs its own Chromium: whatsapp-web.js drives a real
