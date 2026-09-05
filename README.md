@@ -158,6 +158,189 @@ docker compose --profile full up -d
 > - Development (`docker-compose.dev.yml`): SQLite, local storage, both API & Dashboard included
 > - Production (`docker-compose.yml`): Configurable database, profiles for optional services
 
+## 🧹 Inbound Filtering & Memory
+
+A linked session receives everything the phone does. Contact statuses, channel
+posts and broadcast lists arrive on the same event as a real chat, and every one
+of them costs a media download, a database write, a webhook POST and a WebSocket
+frame. On a small container that traffic — not actual usage — is usually what
+drives memory, because attachments are held as base64 (~33% larger than the file)
+and copied again by each consumer.
+
+Statuses, channels and broadcast lists are filtered by default. Groups are not,
+since they carry real traffic for many deployments.
+
+| Variable             | Default | Description                                |
+| -------------------- | ------- | ------------------------------------------ |
+| `IGNORE_STATUS`      | `true`  | Drop `status@broadcast` (contact stories)   |
+| `IGNORE_NEWSLETTERS` | `true`  | Drop `@newsletter` (channel) posts          |
+| `IGNORE_BROADCASTS`  | `true`  | Drop broadcast-list messages                |
+| `IGNORE_GROUPS`      | `false` | Drop `@g.us` (group) messages               |
+
+### Attachments
+
+| Variable                          | Default    | Description                                                                                 |
+| --------------------------------- | ---------- | ------------------------------------------------------------------------------------------- |
+| `DOWNLOAD_MEDIA`                  | `true`     | Download attachments at all. **`false` is the lowest-RAM option**                            |
+| `MEDIA_MAX_BYTES`                 | `16777216` | Per-file cap in bytes (16MB); `0` disables the cap                                           |
+| `MEDIA_ALLOWED_TYPES`             | _(empty)_  | Comma-separated types to accept: `image,video,audio,ptt,document,sticker`; empty accepts all |
+| `MEDIA_UNKNOWN_SIZE_POLICY`       | `skip`     | `skip` or `download` when WhatsApp reports no size                                           |
+| `MEDIA_DOWNLOAD_CONCURRENCY`      | `1`        | Simultaneous downloads per session                                                           |
+| `MEDIA_DOWNLOAD_QUEUE_MAX`        | `10`       | Downloads allowed to wait per session; `0` rejects anything that cannot start now            |
+| `MEDIA_DOWNLOAD_QUEUE_TIMEOUT_MS` | `30000`    | How long a download may wait for a slot                                                      |
+
+`MEDIA_MAX_BYTES` is a cap **on a size WhatsApp reported**, not a guarantee. The
+size is the only signal available before the file is fetched, and WhatsApp does
+not always send one. `MEDIA_UNKNOWN_SIZE_POLICY` decides what happens then:
+
+- `skip` (default) — refuse what cannot be measured. This is what makes the cap
+  an actual bound, at the cost of occasionally skipping a legitimate file.
+- `download` — fetch it anyway. Permissive, and **able to exceed
+  `MEDIA_MAX_BYTES`**, since the size is only known once the file has arrived.
+
+The cap bounds one file; `MEDIA_DOWNLOAD_CONCURRENCY` is what bounds a burst of
+them. Waiting downloads are memory too, so the queue is bounded as well: past
+`MEDIA_DOWNLOAD_QUEUE_MAX` a download is refused outright rather than parked.
+
+For a hard ceiling regardless of what arrives, set `DOWNLOAD_MEDIA=false`. No
+attachment is ever pulled into the process, and messages still reach your
+webhook as text.
+
+Invalid values stop the boot with an error naming the variable —
+`MEDIA_MAX_BYTES=16MB` will not quietly become a 16-byte or unlimited cap.
+
+### Delivery: keeping base64 out of the payload
+
+| Variable                                 | Default   | Description                                                   |
+| ---------------------------------------- | --------- | ------------------------------------------------------------- |
+| `MEDIA_DELIVERY_MODE`                    | `inline`  | `inline`, `storage` or `none`                                  |
+| `MEDIA_STORAGE_TTL_SECONDS`              | `86400`   | How long a stored attachment stays downloadable                |
+| `MEDIA_STORAGE_FAILURE_POLICY`           | `skip`    | `skip` or `inline` when persisting fails                       |
+| `MEDIA_STORAGE_CLEANUP_INTERVAL_SECONDS` | `3600`    | How often expired attachments are swept                        |
+
+The cap and the queue bound what is downloaded. This bounds what happens
+**after**: in `inline` mode one attachment is copied by every consumer — the
+object spread, the hook chain, one `JSON.stringify` per webhook, the WebSocket
+frame — so a single 5MB file can touch tens of MB of heap.
+
+- `inline` (default) — `media.data` carries base64. The existing contract.
+- `storage` — the file is written once, the base64 is dropped, and the payload
+  carries `storageKey`, `url` and `expiresAt` instead.
+- `none` — the payload is dropped after downloading, arriving as
+  `skipped: true, skipReason: "disabled"`.
+
+In `storage` mode the payload looks like this:
+
+```json
+{
+  "media": {
+    "mimetype": "image/jpeg",
+    "filename": "photo.jpg",
+    "size": 123456,
+    "storageKey": "inbound/my-session/2026-09-03/9f2c…",
+    "url": "/api/media/my-session/2026-09-03/9f2c…",
+    "expiresAt": "2026-09-04T18:00:00.000Z"
+  }
+}
+```
+
+`url` is an ordinary API endpoint: fetch it with the same `X-API-Key` you use
+everywhere else. A key restricted with `allowedSessions` can only download that
+session's attachments, and revoking a key revokes its attachments with it. Keys
+are random, references expire, and expired files are swept on an interval and on
+boot. Past `expiresAt` the endpoint answers `410 Gone`.
+
+If persisting fails, `MEDIA_STORAGE_FAILURE_POLICY=skip` (the default) delivers
+`skipReason: "storage-failed"` rather than falling back to base64 — a fallback
+would reintroduce the memory spike exactly when the system is already unhealthy.
+Set it to `inline` if losing the file is worse than the spike.
+
+> This bounds retention and copies **after** the download. It does not remove the
+> initial spike between Chromium and Node.js: whatsapp-web.js hands over the whole
+> file as base64 in one piece. `DOWNLOAD_MEDIA=false` is the only setting that
+> avoids that allocation entirely.
+
+### Watching what a session actually does
+
+`GET /api/sessions/:id/inbound-stats` reports counters for a running session:
+
+```json
+{
+  "messagesDelivered": 12,
+  "ignored": { "status": 431, "newsletter": 27, "group": 8 },
+  "mediaSkipped": { "too-large": 3, "unknown-size": 1 },
+  "downloads": { "active": 0, "waiting": 0, "concurrency": 1, "queueMax": 10, "completed": 9, "bytes": 4194304 }
+}
+```
+
+Counts and categories only — no ids, addresses or content — so it is safe to log
+and graph. Counters live in the engine instance and reset when the session
+restarts. `ignored` is the number to watch: on an account that receives normal
+WhatsApp traffic it will dwarf `messagesDelivered`, and that gap is the work no
+longer being done.
+
+### What a consumer receives
+
+A filtered sender is dropped before any processing happens: no download, no
+database write, no webhook, no WebSocket frame.
+
+A filtered **attachment** is different. The message still reaches your webhook,
+carrying `media.skipped: true` plus a stable `media.skipReason`, so a consumer
+can ask the sender for the file another way instead of silently losing it:
+
+| `skipReason`       | Meaning                                              |
+| ------------------ | ---------------------------------------------------- |
+| `disabled`         | `DOWNLOAD_MEDIA=false`                               |
+| `too-large`        | Reported size exceeded `MEDIA_MAX_BYTES`             |
+| `type-not-allowed` | Type outside `MEDIA_ALLOWED_TYPES`                   |
+| `unknown-size`     | No size reported and policy is `skip`                |
+| `queue-full`       | Too many downloads already waiting                   |
+| `queue-timeout`    | No slot became free within the timeout               |
+| `download-failed`  | WhatsApp refused the file or returned nothing        |
+| `storage-failed`   | Downloaded, but could not be persisted               |
+
+### Recommended for a small container
+
+Only direct chats, text plus lightweight attachments:
+
+```bash
+IGNORE_GROUPS=true
+DOWNLOAD_MEDIA=true
+MEDIA_MAX_BYTES=5242880
+MEDIA_ALLOWED_TYPES=image,document
+MEDIA_UNKNOWN_SIZE_POLICY=skip
+MEDIA_DOWNLOAD_CONCURRENCY=1
+MEDIA_DOWNLOAD_QUEUE_MAX=10
+MEDIA_DELIVERY_MODE=storage
+MEDIA_STORAGE_FAILURE_POLICY=skip
+SESSION_AUTO_RESTORE=false
+PUPPETEER_ARGS=--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-extensions,--disable-background-networking,--mute-audio
+```
+
+This profile is also what `.env.minimal` ships.
+
+`SESSION_AUTO_RESTORE=false` matters after a redeploy: with the default `true`,
+sessions reconnect on their own and start consuming again before anyone asks
+them to. With it off, a session only runs after an explicit
+`POST /api/sessions/:id/start`.
+
+Register webhooks with the exact events you consume rather than `*`, or every
+session state change, delivery receipt and QR refresh will hit your endpoint too:
+
+```json
+{ "url": "https://your-server.com/webhook", "events": ["message.received"] }
+```
+
+### The floor these settings cannot lower
+
+Every active session runs its own Chromium: whatsapp-web.js drives a real
+browser, so a connected session costs a few hundred MB before a single message
+arrives. Filtering removes the spikes and the growth, not the baseline — sizing a
+container means budgeting per active session, and `SESSION_AUTO_RESTORE=false` is
+what keeps idle sessions from claiming that baseline unasked.
+
+---
+
 ## 🔌 Ports
 
 | Service   | Port            | Description              |
