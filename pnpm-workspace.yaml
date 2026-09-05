@@ -1,0 +1,11 @@
+ignoredBuiltDependencies:
+  - '@scarf/scarf'
+  - cpu-features
+  - msgpackr-extract
+  - protobufjs
+  - ssh2
+  - unrs-resolver
+
+onlyBuiltDependencies:
+  - puppeteer
+  - sqlite3
