@@ -4,6 +4,8 @@ import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
+import { LoggerService, LogLevel } from './common/services/logger.service';
+import { parseEnum } from './config/env.parsers';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -65,6 +67,12 @@ STORAGE_PATH=./data/media
 }
 
 async function bootstrap() {
+  // Applied before the app is created, so the first boot log already honours it.
+  // LOG_LEVEL was documented in .env.example but nothing read it: the level was
+  // hard-coded to INFO, which made every debug line - including the one saying a
+  // status was filtered - unreachable in a running deployment.
+  LoggerService.setLogLevel(parseEnum('LOG_LEVEL', process.env.LOG_LEVEL, Object.values(LogLevel), LogLevel.INFO));
+
   const app = await NestFactory.create(AppModule);
 
   // Enable shutdown hooks for graceful shutdown

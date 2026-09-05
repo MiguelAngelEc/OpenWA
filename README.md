@@ -158,6 +158,48 @@ docker compose --profile full up -d
 > - Development (`docker-compose.dev.yml`): SQLite, local storage, both API & Dashboard included
 > - Production (`docker-compose.yml`): Configurable database, profiles for optional services
 
+### Railway
+
+`railway.toml` sets the healthcheck and mounts a volume at `/app/data`, which is
+what keeps sessions and the SQLite database across deploys. Without that volume
+every deploy loses the WhatsApp login and asks for a new QR.
+
+Set these variables on the service before the first deploy:
+
+```bash
+NODE_ENV=production
+DATABASE_TYPE=sqlite
+STORAGE_TYPE=local
+STORAGE_LOCAL_PATH=/app/data/media
+SESSION_DATA_PATH=/app/data/sessions
+
+# Do not resume traffic on its own after a deploy
+SESSION_AUTO_RESTORE=false
+
+# Inbound profile (see below for what each one does)
+IGNORE_GROUPS=true
+MEDIA_MAX_BYTES=5242880
+MEDIA_ALLOWED_TYPES=image,document
+MEDIA_UNKNOWN_SIZE_POLICY=skip
+MEDIA_DOWNLOAD_CONCURRENCY=1
+MEDIA_DOWNLOAD_QUEUE_MAX=10
+MEDIA_DELIVERY_MODE=storage
+
+PUPPETEER_ARGS=--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-extensions,--disable-background-networking,--mute-audio
+NODE_OPTIONS=--max-old-space-size=512
+CORS_ORIGINS=https://your-dashboard-domain
+```
+
+Railway sets `PORT` itself — do not override it.
+
+A container running one session needs roughly 1 GB: Chromium is a few hundred MB
+before a single message arrives, and `--max-old-space-size=512` caps what Node
+adds on top rather than letting a burst decide.
+
+After deploying, start the session explicitly (`SESSION_AUTO_RESTORE=false` means
+it will not start itself), scan the QR, and check `inbound-stats` to confirm the
+filters are doing their job before pointing anything at it.
+
 ## 🧹 Inbound Filtering & Memory
 
 A linked session receives everything the phone does. Contact statuses, channel
@@ -356,6 +398,28 @@ ends — it should stay near zero, and the script exits non-zero if it does not.
 
 Use it to check a config change before deploying it, or as a regression guard:
 the numbers are deterministic, so a jump means something actually changed.
+
+### Verifying a live session
+
+Counters, not logs, are the reliable check — they do not depend on the log level:
+
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/sessions/$SESSION_ID/inbound-stats
+```
+
+`ignored.status` climbing while `downloads.completed` stays at 0 is the proof:
+statuses arrived, were dropped, and nothing was fetched. Test it with a status
+posted by someone else — WhatsApp does not send your own back to you.
+
+For the per-message detail, raise the level:
+
+```bash
+LOG_LEVEL=debug
+```
+
+Then each filtered message logs `Ignored inbound status message` (category only,
+never the address). Leave it at `info` in production; a busy account makes that
+line very frequent.
 
 ### The floor these settings cannot lower
 
