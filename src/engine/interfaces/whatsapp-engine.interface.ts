@@ -22,6 +22,23 @@ export interface MediaInput {
   caption?: string;
 }
 
+/**
+ * Why an inbound attachment was not delivered.
+ *
+ * Part of the public webhook contract: consumers branch on these, so values are
+ * added rather than renamed.
+ *
+ * - `disabled`         downloads are turned off entirely
+ * - `too-large`        the attachment exceeds the configured byte cap
+ * - `type-not-allowed` the message type is outside the configured allow-list
+ * - `unknown-size`     WhatsApp reported no size and policy is to not download
+ * - `queue-full`       too many downloads were already waiting
+ * - `queue-timeout`    no download slot became free in time
+ * - `download-failed`  WhatsApp refused or returned nothing
+ */
+export type MediaSkipReason =
+  'disabled' | 'too-large' | 'type-not-allowed' | 'unknown-size' | 'queue-full' | 'queue-timeout' | 'download-failed';
+
 export interface IncomingMessage {
   id: string;
   from: string;
@@ -33,9 +50,14 @@ export interface IncomingMessage {
   fromMe: boolean;
   isGroup: boolean;
   media?: {
-    mimetype: string;
+    mimetype?: string;
     filename?: string;
     data?: string; // base64
+    /** Byte count reported by WhatsApp; present even when the download was skipped. */
+    size?: number;
+    /** True when the attachment was not downloaded. `data` is absent. */
+    skipped?: boolean;
+    skipReason?: MediaSkipReason;
   };
   quotedMessage?: {
     id: string;

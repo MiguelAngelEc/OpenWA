@@ -5,13 +5,14 @@
 
 import { PluginContext, PluginType, IEnginePlugin } from '../../../core/plugins';
 import { IWhatsAppEngine } from '../../../engine/interfaces/whatsapp-engine.interface';
-import { WhatsAppWebJsAdapter } from '../../../engine/adapters/whatsapp-web-js.adapter';
+import { WhatsAppWebJsAdapter, MessageFilterConfig } from '../../../engine/adapters/whatsapp-web-js.adapter';
 
 export interface WhatsAppWebJsConfig {
   sessionDataPath?: string;
   headless?: boolean;
   puppeteerArgs?: string[];
   initTimeout?: number;
+  messages?: MessageFilterConfig;
 }
 
 export class WhatsAppWebJsPlugin implements IEnginePlugin {
@@ -44,6 +45,12 @@ export class WhatsAppWebJsPlugin implements IEnginePlugin {
     const puppeteerArgs = (config.puppeteerArgs as string[]) ??
       (this.context?.config.puppeteerArgs as string[]) ?? ['--no-sandbox', '--disable-setuid-sandbox'];
     const initTimeout = (config.initTimeout as number) ?? (this.context?.config.initTimeout as number) ?? 90000;
+    // Undefined is meaningful here: the adapter applies its own documented
+    // defaults per field, so an absent filter config must not become an empty
+    // object that looks configured.
+    const messages =
+      (config.messages as MessageFilterConfig | undefined) ??
+      (this.context?.config.messages as MessageFilterConfig | undefined);
 
     const proxyUrl = config.proxyUrl as string | undefined;
     const proxyType = config.proxyType as 'http' | 'https' | 'socks4' | 'socks5' | undefined;
@@ -62,6 +69,7 @@ export class WhatsAppWebJsPlugin implements IEnginePlugin {
           }
         : undefined,
       initTimeout,
+      messages,
     });
   }
 

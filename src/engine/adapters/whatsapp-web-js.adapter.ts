@@ -29,6 +29,7 @@ import {
   Product,
   ProductQueryOptions,
   PaginatedProducts,
+  MediaSkipReason,
 } from '../interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import {
@@ -37,7 +38,51 @@ import {
   BusinessClient,
   WwjsChannelData,
   GroupCreateResult,
+  MessageRawData,
 } from '../types/whatsapp-web-js.types';
+
+/**
+ * Which attachments are worth pulling into memory.
+ *
+ * downloadMedia() returns base64, which is ~33% larger than the file itself,
+ * and that string is then copied by the hook chain, JSON.stringify'd for every
+ * webhook and pushed over the WebSocket. A single unfiltered 50MB video can
+ * therefore touch several hundred MB of heap, so the decision to download has
+ * to happen before the call, not after.
+ */
+export interface MediaPolicyConfig {
+  /** Download attachments at all. Default true. */
+  download?: boolean;
+  /** Largest attachment to download, in bytes. 0 disables the cap. */
+  maxBytes?: number;
+  /** whatsapp-web.js message types to accept (image, document, video, ...). Empty = all. */
+  allowedTypes?: string[];
+  /**
+   * What to do when WhatsApp reports no size. Default 'skip': a cap that is
+   * waived whenever the size is missing bounds nothing.
+   */
+  unknownSizePolicy?: 'skip' | 'download';
+}
+
+/**
+ * Which senders are worth processing.
+ *
+ * A linked session receives far more than direct chats on the `message` event:
+ * every contact status, channel post and broadcast list arrives there too. None
+ * of them is a person writing to the session, yet each one costs a media
+ * download, a DB write, a webhook POST and a WebSocket frame.
+ */
+export interface MessageFilterConfig {
+  /** Drop `status@broadcast` (contact stories). Default true. */
+  ignoreStatus?: boolean;
+  /** Drop `@newsletter` (channel) posts. Default true. */
+  ignoreNewsletters?: boolean;
+  /** Drop broadcast-list messages. Default true. */
+  ignoreBroadcasts?: boolean;
+  /** Drop `@g.us` (group) messages. Default false - groups are legitimate traffic. */
+  ignoreGroups?: boolean;
+  media?: MediaPolicyConfig;
+}
 
 export interface WhatsAppWebJsConfig {
   sessionId: string;
@@ -53,6 +98,8 @@ export interface WhatsAppWebJsConfig {
   };
   /** Hard cap for initialize(); 0 disables the timeout. */
   initTimeout?: number;
+  /** Inbound filtering. Anything omitted falls back to the documented default. */
+  messages?: MessageFilterConfig;
 }
 
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
@@ -322,6 +369,189 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
   }
 
+  /**
+   * Short, non-identifying handle for a message, for logs.
+   *
+   * A full WhatsApp message id encodes the chat - so the remote number - and
+   * logs are the one place that data has no reason to be.
+   */
+  private static logId(messageId: string): string {
+    return messageId.slice(-8);
+  }
+
+  /**
+   * The one place that reaches into whatsapp-web.js's untyped `_data`.
+   *
+   * `size` is the only signal about an attachment available *before* the
+   * download, which makes it the only thing a byte cap can be enforced against.
+   */
+  private static getRawData(msg: WwebMessage): MessageRawData | undefined {
+    return (
+      (msg as unknown as { rawData?: MessageRawData; _data?: MessageRawData }).rawData ??
+      (msg as unknown as { _data?: MessageRawData })._data
+    );
+  }
+
+  /**
+   * Returns the category a sender was filtered as, or null when the message is
+   * a real chat that should be processed. Called first thing in the `message`
+   * handler so filtered traffic never reaches the media download, the hook
+   * chain, the database, the webhooks or the WebSocket.
+   *
+   * Categories are matched on whatsapp-web.js's own flags first and the address
+   * suffix second. Deliberately a deny-list: WhatsApp is migrating identities to
+   * new formats such as `@lid`, and an allow-list of known suffixes would start
+   * discarding real conversations the day one of them ships.
+   */
+  private getIgnoredSenderCategory(msg: Pick<WwebMessage, 'from' | 'isStatus' | 'broadcast'>): string | null {
+    const filters = this.config.messages ?? {};
+    const from = msg.from ?? '';
+    // `isStatus` is the reliable signal; the address is the fallback for
+    // library versions that leave the flag unset.
+    const isStatus = msg.isStatus === true || from === 'status@broadcast';
+
+    if ((filters.ignoreStatus ?? true) && isStatus) return 'status';
+    if ((filters.ignoreNewsletters ?? true) && from.endsWith('@newsletter')) return 'newsletter';
+    // Status carries both the flag and the @broadcast suffix, so it is excluded
+    // here to keep ignoreStatus=false meaningful when lists stay filtered.
+    if ((filters.ignoreBroadcasts ?? true) && !isStatus && (msg.broadcast === true || from.endsWith('@broadcast'))) {
+      return 'broadcast';
+    }
+    if ((filters.ignoreGroups ?? false) && from.endsWith('@g.us')) return 'group';
+
+    return null;
+  }
+
+  /**
+   * Why an attachment must not be downloaded, or null when it may be.
+   *
+   * @param size Byte count from the raw payload, or undefined when WhatsApp
+   *   reported none. An unmeasurable attachment is governed by
+   *   `unknownSizePolicy`, because a cap that is skipped whenever the size is
+   *   missing is not a bound on anything.
+   */
+  private getMediaSkipReason(messageType: string, size: number | undefined): MediaSkipReason | null {
+    const policy = this.config.messages?.media ?? {};
+
+    if (!(policy.download ?? true)) return 'disabled';
+
+    const allowedTypes = policy.allowedTypes ?? [];
+    // Types are normalised on both sides so "Image" and " image " behave like
+    // the documented "image".
+    if (allowedTypes.length > 0 && !allowedTypes.includes(messageType.trim().toLowerCase())) {
+      return 'type-not-allowed';
+    }
+
+    const maxBytes = policy.maxBytes ?? 0;
+    if (maxBytes <= 0) return null; // cap disabled: size is irrelevant
+
+    if (size === undefined || size <= 0) {
+      return (policy.unknownSizePolicy ?? 'skip') === 'skip' ? 'unknown-size' : null;
+    }
+
+    return size > maxBytes ? 'too-large' : null;
+  }
+
+  /**
+   * Resolves the `media` field for a message that has an attachment.
+   *
+   * Always returns a value: an attachment that was not downloaded still travels
+   * as metadata with `skipped: true` and a reason, so a consumer can ask the
+   * sender for the file another way instead of silently receiving nothing.
+   */
+  private async resolveMedia(msg: WwebMessage): Promise<NonNullable<IncomingMessage['media']>> {
+    const rawData = WhatsAppWebJsAdapter.getRawData(msg);
+    const size = rawData?.size;
+
+    const skipped = (skipReason: MediaSkipReason): NonNullable<IncomingMessage['media']> => ({
+      mimetype: rawData?.mimetype,
+      size,
+      skipped: true,
+      skipReason,
+    });
+
+    const filterReason = this.getMediaSkipReason(msg.type, size);
+    if (filterReason) {
+      this.logger.debug(
+        `Skipped media download (${filterReason}) for message ${WhatsAppWebJsAdapter.logId(msg.id._serialized)}`,
+      );
+      return skipped(filterReason);
+    }
+
+    try {
+      const media = await msg.downloadMedia();
+      // whatsapp-web.js resolves with undefined for media it cannot fetch
+      // (expired, revoked, unsupported), which must read the same as a throw.
+      if (!media) {
+        this.logger.warn(
+          `downloadMedia returned no data for message ${WhatsAppWebJsAdapter.logId(msg.id._serialized)}`,
+        );
+        return skipped('download-failed');
+      }
+
+      return {
+        mimetype: media.mimetype,
+        filename: media.filename || undefined,
+        data: media.data,
+        size,
+      };
+    } catch (error) {
+      this.logger.error('Error downloading media', String(error));
+      return skipped('download-failed');
+    }
+  }
+
+  /**
+   * Turns a whatsapp-web.js message into the engine's own shape, or null when
+   * the message was filtered. Split out of the event handler so the whole path
+   * - filters, media policy, queueing - is reachable from tests without a
+   * browser.
+   */
+  async processIncomingMessage(msg: WwebMessage): Promise<IncomingMessage | null> {
+    const ignoredAs = this.getIgnoredSenderCategory(msg);
+    if (ignoredAs) {
+      // The category, not the address: a filtered status still identifies a
+      // contact, and counting it is all this needs to be useful.
+      this.logger.debug(`Ignored inbound ${ignoredAs} message`);
+      return null;
+    }
+
+    // The `message` event is inbound-only today, but this keeps the session from
+    // echoing its own sends if anything ever switches to `message_create`,
+    // which does fire for them.
+    if (msg.fromMe) return null;
+
+    const incomingMessage: IncomingMessage = {
+      id: msg.id._serialized,
+      from: msg.from,
+      to: msg.to,
+      chatId: msg.from,
+      body: msg.body,
+      type: msg.type,
+      timestamp: msg.timestamp,
+      fromMe: msg.fromMe,
+      isGroup: (msg.from ?? '').endsWith('@g.us'),
+    };
+
+    if (msg.hasMedia) {
+      incomingMessage.media = await this.resolveMedia(msg);
+    }
+
+    if (msg.hasQuotedMsg) {
+      try {
+        const quoted = await msg.getQuotedMessage();
+        incomingMessage.quotedMessage = {
+          id: quoted.id._serialized,
+          body: quoted.body,
+        };
+      } catch (error) {
+        this.logger.error('Error getting quoted message', String(error));
+      }
+    }
+
+    return incomingMessage;
+  }
+
   private setupEventHandlers(): void {
     if (!this.client) return;
 
@@ -358,48 +588,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
     this.client.on('message', async msg => {
       try {
-        const incomingMessage: IncomingMessage = {
-          id: msg.id._serialized,
-          from: msg.from,
-          to: msg.to,
-          chatId: msg.from,
-          body: msg.body,
-          type: msg.type,
-          timestamp: msg.timestamp,
-          fromMe: msg.fromMe,
-          isGroup: msg.from.endsWith('@g.us'),
-        };
-
-        // Handle media
-        if (msg.hasMedia) {
-          try {
-            const media = await msg.downloadMedia();
-            if (media) {
-              incomingMessage.media = {
-                mimetype: media.mimetype,
-                filename: media.filename || undefined,
-                data: media.data,
-              };
-            }
-          } catch (error) {
-            this.logger.error('Error downloading media', String(error));
-          }
+        const incomingMessage = await this.processIncomingMessage(msg);
+        // A message destroyed mid-download must not resurface downstream as a
+        // late write to a session that is already being torn down.
+        if (incomingMessage && !this.destroyed) {
+          this.callbacks.onMessage?.(incomingMessage);
         }
-
-        // Handle quoted message
-        if (msg.hasQuotedMsg) {
-          try {
-            const quoted = await msg.getQuotedMessage();
-            incomingMessage.quotedMessage = {
-              id: quoted.id._serialized,
-              body: quoted.body,
-            };
-          } catch (error) {
-            this.logger.error('Error getting quoted message', String(error));
-          }
-        }
-
-        this.callbacks.onMessage?.(incomingMessage);
       } catch (error) {
         this.logger.error('Error processing incoming message', String(error));
       }

@@ -93,3 +93,16 @@ export interface WwjsChannelMessage {
 export interface GroupCreateResult {
   gid: { _serialized: string };
 }
+
+/**
+ * Raw WhatsApp payload that whatsapp-web.js keeps on a Message without typing.
+ *
+ * `size` is the attachment byte count as reported by WhatsApp and is available
+ * *before* downloadMedia() runs - which is the only reason a size cap can be
+ * enforced at all. Both fields are best-effort: WhatsApp omits them for some
+ * message types, so callers must handle `undefined`.
+ */
+export interface MessageRawData {
+  size?: number;
+  mimetype?: string;
+}

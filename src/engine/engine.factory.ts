@@ -1,7 +1,7 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { IWhatsAppEngine } from './interfaces/whatsapp-engine.interface';
-import { WhatsAppWebJsAdapter } from './adapters/whatsapp-web-js.adapter';
+import { WhatsAppWebJsAdapter, MessageFilterConfig } from './adapters/whatsapp-web-js.adapter';
 import { PluginLoaderService, PluginType, IEnginePlugin, PluginManifest } from '../core/plugins';
 import { WhatsAppWebJsPlugin } from '../plugins/engines/whatsapp-web-js';
 import { createLogger } from '../common/services/logger.service';
@@ -60,6 +60,27 @@ export class EngineFactory implements OnModuleInit {
     }
   }
 
+  /**
+   * Inbound filtering resolved from app config. Passed explicitly to the engine
+   * for the same reason sessionDataPath is: the plugin context carries no
+   * runtime config, so a plugin-created engine would otherwise silently fall
+   * back to its own defaults and download every status the account receives.
+   */
+  private getMessageFilterConfig(): MessageFilterConfig {
+    return {
+      ignoreStatus: this.configService.get<boolean>('engine.messages.ignoreStatus'),
+      ignoreNewsletters: this.configService.get<boolean>('engine.messages.ignoreNewsletters'),
+      ignoreBroadcasts: this.configService.get<boolean>('engine.messages.ignoreBroadcasts'),
+      ignoreGroups: this.configService.get<boolean>('engine.messages.ignoreGroups'),
+      media: {
+        download: this.configService.get<boolean>('engine.messages.media.download'),
+        maxBytes: this.configService.get<number>('engine.messages.media.maxBytes'),
+        allowedTypes: this.configService.get<string[]>('engine.messages.media.allowedTypes'),
+        unknownSizePolicy: this.configService.get<'skip' | 'download'>('engine.messages.media.unknownSizePolicy'),
+      },
+    };
+  }
+
   create(options: EngineCreateOptions): IWhatsAppEngine {
     // Try to get engine from plugin system
     const enginePlugin = this.pluginLoader.getPlugin(this.engineType);
@@ -77,6 +98,7 @@ export class EngineFactory implements OnModuleInit {
         headless: this.configService.get<boolean>('engine.puppeteer.headless') ?? true,
         puppeteerArgs: this.configService.get<string[]>('engine.puppeteer.args'),
         initTimeout: this.configService.get<number>('engine.initTimeout') ?? 90000,
+        messages: this.getMessageFilterConfig(),
       }) as IWhatsAppEngine;
     }
 
@@ -115,6 +137,7 @@ export class EngineFactory implements OnModuleInit {
           }
         : undefined,
       initTimeout: this.configService.get<number>('engine.initTimeout') ?? 90000,
+      messages: this.getMessageFilterConfig(),
     });
   }
 
