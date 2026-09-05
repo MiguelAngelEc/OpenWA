@@ -129,8 +129,14 @@ export function Sessions() {
   const handleStart = async (id: string) => {
     const session = sessions.find(s => s.id === id);
     if (session && ['initializing', 'connecting', 'qr_ready'].includes(session.status)) {
-      handleShowQR(id);
-      return;
+      try {
+        const qr = await sessionApi.getQR(id);
+        setQrData({ sessionId: id, sessionName: session.name, qrCode: qr.qrCode });
+        return;
+      } catch {
+        // The stored status is stale (engine is not actually running), so fall
+        // through and start the session instead of only asking for a QR.
+      }
     }
 
     try {
@@ -150,12 +156,22 @@ export function Sessions() {
   const handleShowQR = async (id: string) => {
     const session = sessions.find(s => s.id === id);
     const sessionName = session?.name || '';
-    try {
-      const qr = await sessionApi.getQR(id);
-      setQrData({ sessionId: id, sessionName, qrCode: qr.qrCode });
-    } catch (err) {
-      console.error('Failed to get QR:', err);
-      setError(t('sessions.qr.unavailable'));
+
+    // The engine emits its first QR a few seconds after the browser boots, so a
+    // single request often lands on "QR code is not ready yet". Retry for ~15s.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const qr = await sessionApi.getQR(id);
+        setQrData({ sessionId: id, sessionName, qrCode: qr.qrCode });
+        return;
+      } catch (err) {
+        if (attempt === 9) {
+          console.error('Failed to get QR:', err);
+          setError(t('sessions.qr.unavailable'));
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
   };
 
