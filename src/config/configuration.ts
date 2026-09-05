@@ -1,3 +1,13 @@
+import { parseBoolean, parseEnum, parseInteger, parseList } from './env.parsers';
+
+/**
+ * whatsapp-web.js message types that can carry an attachment. Used to validate
+ * MEDIA_ALLOWED_TYPES: a typo there would otherwise filter out the very type it
+ * was meant to permit, and the only symptom would be attachments quietly going
+ * missing.
+ */
+const MEDIA_MESSAGE_TYPES = ['image', 'video', 'audio', 'ptt', 'document', 'sticker'] as const;
+
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
 
@@ -63,6 +73,57 @@ export default () => ({
     initTimeout: parseInt(process.env.SESSION_INIT_TIMEOUT || '90000', 10),
     // How long GET /sessions/:id/qr waits for the first QR before giving up.
     qrWaitTimeout: parseInt(process.env.SESSION_QR_WAIT_TIMEOUT || '30000', 10),
+
+    // Inbound message filtering.
+    //
+    // A linked session receives everything the phone does: contact statuses,
+    // channel posts and broadcast lists all arrive on the same event as a real
+    // chat. None of them is a person writing to the session, but each one costs
+    // a media download, a DB write, a webhook POST and a WebSocket frame. On a
+    // small container that noise, not the actual usage, is what drives memory.
+    //
+    // Statuses, channels and broadcasts are filtered by default because they
+    // are never a direct message. Groups are not - they carry real traffic for
+    // plenty of deployments - so opt in with IGNORE_GROUPS=true.
+    messages: {
+      ignoreStatus: parseBoolean('IGNORE_STATUS', process.env.IGNORE_STATUS, true),
+      ignoreNewsletters: parseBoolean('IGNORE_NEWSLETTERS', process.env.IGNORE_NEWSLETTERS, true),
+      ignoreBroadcasts: parseBoolean('IGNORE_BROADCASTS', process.env.IGNORE_BROADCASTS, true),
+      ignoreGroups: parseBoolean('IGNORE_GROUPS', process.env.IGNORE_GROUPS, false),
+      media: {
+        download: parseBoolean('DOWNLOAD_MEDIA', process.env.DOWNLOAD_MEDIA, true),
+        // Attachments are held in memory as base64 (~33% larger than the file)
+        // and copied again by every consumer, so an unbounded download is the
+        // single largest memory risk in the pipeline. 0 disables the cap.
+        maxBytes: parseInteger('MEDIA_MAX_BYTES', process.env.MEDIA_MAX_BYTES, 16777216, { min: 0 }),
+        // Empty accepts every type.
+        allowedTypes: parseList('MEDIA_ALLOWED_TYPES', process.env.MEDIA_ALLOWED_TYPES, MEDIA_MESSAGE_TYPES),
+        // WhatsApp does not always report an attachment size, and the size is
+        // the only thing available before downloading. `skip` refuses to
+        // download what it cannot measure, which is the only way the cap is a
+        // real bound; `download` restores the permissive behaviour for
+        // deployments that would rather risk the memory than lose a file.
+        unknownSizePolicy: parseEnum(
+          'MEDIA_UNKNOWN_SIZE_POLICY',
+          process.env.MEDIA_UNKNOWN_SIZE_POLICY,
+          ['skip', 'download'] as const,
+          'skip',
+        ),
+        // Downloads run one at a time by default. The cap bounds a single
+        // file; concurrency is what bounds a burst of them, and a status flood
+        // arrives as exactly that.
+        concurrency: parseInteger('MEDIA_DOWNLOAD_CONCURRENCY', process.env.MEDIA_DOWNLOAD_CONCURRENCY, 1, { min: 1 }),
+        // Waiting downloads are themselves memory. An unbounded queue only
+        // moves the problem from Chromium into the event loop.
+        queueMax: parseInteger('MEDIA_DOWNLOAD_QUEUE_MAX', process.env.MEDIA_DOWNLOAD_QUEUE_MAX, 10, { min: 0 }),
+        queueTimeoutMs: parseInteger(
+          'MEDIA_DOWNLOAD_QUEUE_TIMEOUT_MS',
+          process.env.MEDIA_DOWNLOAD_QUEUE_TIMEOUT_MS,
+          30000,
+          { min: 1 },
+        ),
+      },
+    },
   },
 
   // Webhook configuration

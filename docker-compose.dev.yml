@@ -20,6 +20,20 @@ services:
       - SESSION_DATA_PATH=/app/data/sessions
       - PUPPETEER_HEADLESS=true
       - PUPPETEER_ARGS=--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu
+      - SESSION_AUTO_RESTORE=${SESSION_AUTO_RESTORE:-true}
+      # Inbound filtering (see README > Inbound Filtering & Memory)
+      - IGNORE_STATUS=${IGNORE_STATUS:-true}
+      - IGNORE_NEWSLETTERS=${IGNORE_NEWSLETTERS:-true}
+      - IGNORE_BROADCASTS=${IGNORE_BROADCASTS:-true}
+      - IGNORE_GROUPS=${IGNORE_GROUPS:-false}
+      # Inbound media
+      - DOWNLOAD_MEDIA=${DOWNLOAD_MEDIA:-true}
+      - MEDIA_MAX_BYTES=${MEDIA_MAX_BYTES:-16777216}
+      - MEDIA_ALLOWED_TYPES=${MEDIA_ALLOWED_TYPES:-}
+      - MEDIA_UNKNOWN_SIZE_POLICY=${MEDIA_UNKNOWN_SIZE_POLICY:-skip}
+      - MEDIA_DOWNLOAD_CONCURRENCY=${MEDIA_DOWNLOAD_CONCURRENCY:-1}
+      - MEDIA_DOWNLOAD_QUEUE_MAX=${MEDIA_DOWNLOAD_QUEUE_MAX:-10}
+      - MEDIA_DOWNLOAD_QUEUE_TIMEOUT_MS=${MEDIA_DOWNLOAD_QUEUE_TIMEOUT_MS:-30000}
       - STORAGE_TYPE=local
       - STORAGE_LOCAL_PATH=/app/data/media
       - WEBHOOK_TIMEOUT=10000
