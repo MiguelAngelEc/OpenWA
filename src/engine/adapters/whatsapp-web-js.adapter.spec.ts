@@ -235,4 +235,124 @@ describe('WhatsAppWebJsAdapter.processIncomingMessage', () => {
       });
     });
   });
+
+  // ── Download queue ────────────────────────────────────────────────
+
+  describe('download queue', () => {
+    /** A download that only settles when the returned resolve is called. */
+    const pendingDownload = () => {
+      let release!: () => void;
+      const started = jest.fn();
+      const downloadMedia = jest.fn().mockImplementation(() => {
+        started();
+        return new Promise(resolve => {
+          release = () => resolve({ mimetype: 'image/jpeg', data: 'BASE64' });
+        });
+      });
+      return { downloadMedia, started, release: () => release() };
+    };
+
+    const mediaMessage = (downloadMedia: jest.Mock) =>
+      fakeMessage({ hasMedia: true, type: 'image', size: 1024, downloadMedia }).message;
+
+    it('never runs more downloads at once than the configured concurrency', async () => {
+      const first = pendingDownload();
+      const second = pendingDownload();
+      const adapter = build({ media: { concurrency: 1, queueMax: 5 } });
+
+      const firstRun = adapter.processIncomingMessage(mediaMessage(first.downloadMedia));
+      const secondRun = adapter.processIncomingMessage(mediaMessage(second.downloadMedia));
+      await Promise.resolve();
+
+      expect(first.downloadMedia).toHaveBeenCalledTimes(1);
+      expect(second.downloadMedia).not.toHaveBeenCalled();
+      expect(adapter.getMediaDownloadStats()).toMatchObject({ active: 1, waiting: 1 });
+
+      first.release();
+      await firstRun;
+      second.release();
+      await secondRun;
+
+      expect(second.downloadMedia).toHaveBeenCalledTimes(1);
+      expect(adapter.getMediaDownloadStats()).toMatchObject({ active: 0, waiting: 0 });
+    });
+
+    it('rejects with queue-full instead of growing the queue', async () => {
+      const running = pendingDownload();
+      const queued = pendingDownload();
+      const rejected = pendingDownload();
+      const adapter = build({ media: { concurrency: 1, queueMax: 1 } });
+
+      const runningRun = adapter.processIncomingMessage(mediaMessage(running.downloadMedia));
+      const queuedRun = adapter.processIncomingMessage(mediaMessage(queued.downloadMedia));
+      await Promise.resolve();
+
+      const result = await adapter.processIncomingMessage(mediaMessage(rejected.downloadMedia));
+
+      expect(rejected.downloadMedia).not.toHaveBeenCalled();
+      expect(result?.media).toMatchObject({ skipped: true, skipReason: 'queue-full' });
+
+      running.release();
+      await runningRun;
+      queued.release();
+      await queuedRun;
+    });
+
+    it('gives up with queue-timeout rather than waiting forever', async () => {
+      jest.useFakeTimers();
+      try {
+        const running = pendingDownload();
+        const waiting = pendingDownload();
+        const adapter = build({ media: { concurrency: 1, queueMax: 5, queueTimeoutMs: 1000 } });
+
+        const runningRun = adapter.processIncomingMessage(mediaMessage(running.downloadMedia));
+        const waitingRun = adapter.processIncomingMessage(mediaMessage(waiting.downloadMedia));
+        await Promise.resolve();
+
+        jest.advanceTimersByTime(1001);
+        const result = await waitingRun;
+
+        expect(waiting.downloadMedia).not.toHaveBeenCalled();
+        expect(result?.media).toMatchObject({ skipped: true, skipReason: 'queue-timeout' });
+
+        running.release();
+        await runningRun;
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('releases the slot after a failed download', async () => {
+      const adapter = build({ media: { concurrency: 1 } });
+      const failing = fakeMessage({
+        hasMedia: true,
+        type: 'image',
+        size: 1024,
+        downloadMedia: jest.fn().mockRejectedValue(new Error('boom')),
+      });
+
+      await adapter.processIncomingMessage(failing.message);
+
+      expect(adapter.getMediaDownloadStats()).toMatchObject({ active: 0, waiting: 0 });
+    });
+
+    it('cancels queued downloads when the session is destroyed', async () => {
+      const running = pendingDownload();
+      const queued = pendingDownload();
+      const adapter = build({ media: { concurrency: 1, queueMax: 5 } });
+
+      const runningRun = adapter.processIncomingMessage(mediaMessage(running.downloadMedia));
+      const queuedRun = adapter.processIncomingMessage(mediaMessage(queued.downloadMedia));
+      await Promise.resolve();
+
+      await adapter.destroy();
+      const result = await queuedRun;
+
+      expect(queued.downloadMedia).not.toHaveBeenCalled();
+      expect(result?.media).toMatchObject({ skipped: true, skipReason: 'download-failed' });
+
+      running.release();
+      await runningRun;
+    });
+  });
 });

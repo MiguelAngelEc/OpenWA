@@ -30,8 +30,10 @@ import {
   ProductQueryOptions,
   PaginatedProducts,
   MediaSkipReason,
+  InboundStats,
 } from '../interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
+import { Semaphore, QueueFullError, QueueTimeoutError, SemaphoreStats } from '../../common/utils/semaphore';
 import {
   GroupChat,
   MessageWithReactions,
@@ -62,6 +64,12 @@ export interface MediaPolicyConfig {
    * waived whenever the size is missing bounds nothing.
    */
   unknownSizePolicy?: 'skip' | 'download';
+  /** Simultaneous downloads per session. Default 1. */
+  concurrency?: number;
+  /** Downloads allowed to wait per session. Default 10. */
+  queueMax?: number;
+  /** How long a download may wait for a slot, in ms. Default 30000. */
+  queueTimeoutMs?: number;
 }
 
 /**
@@ -112,6 +120,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private destroyed = false;
   private browserPid: number | null = null;
   private pidTracker: NodeJS.Timeout | null = null;
+  private downloadSemaphore: Semaphore | null = null;
+  private readonly stats = {
+    messagesDelivered: 0,
+    ignored: {} as Record<string, number>,
+    mediaSkipped: {} as Record<string, number>,
+    downloads: { completed: 0, bytes: 0 },
+  };
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
@@ -452,6 +467,19 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return size > maxBytes ? 'too-large' : null;
   }
 
+  /** Lazily built so a config-less adapter (tests, fallbacks) still works. */
+  private getDownloadSemaphore(): Semaphore {
+    if (!this.downloadSemaphore) {
+      const policy = this.config.messages?.media ?? {};
+      this.downloadSemaphore = new Semaphore({
+        concurrency: policy.concurrency ?? 1,
+        queueMax: policy.queueMax ?? 10,
+        timeoutMs: policy.queueTimeoutMs ?? 30000,
+      });
+    }
+    return this.downloadSemaphore;
+  }
+
   /**
    * Resolves the `media` field for a message that has an attachment.
    *
@@ -463,12 +491,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const rawData = WhatsAppWebJsAdapter.getRawData(msg);
     const size = rawData?.size;
 
-    const skipped = (skipReason: MediaSkipReason): NonNullable<IncomingMessage['media']> => ({
-      mimetype: rawData?.mimetype,
-      size,
-      skipped: true,
-      skipReason,
-    });
+    const skipped = (skipReason: MediaSkipReason): NonNullable<IncomingMessage['media']> => {
+      this.stats.mediaSkipped[skipReason] = (this.stats.mediaSkipped[skipReason] ?? 0) + 1;
+      return { mimetype: rawData?.mimetype, size, skipped: true, skipReason };
+    };
 
     const filterReason = this.getMediaSkipReason(msg.type, size);
     if (filterReason) {
@@ -476,6 +502,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         `Skipped media download (${filterReason}) for message ${WhatsAppWebJsAdapter.logId(msg.id._serialized)}`,
       );
       return skipped(filterReason);
+    }
+
+    // The turn is taken only after every cheap check has passed, so a message
+    // that was never going to be downloaded does not occupy a queue slot.
+    let release: () => void;
+    try {
+      release = await this.getDownloadSemaphore().acquire();
+    } catch (error) {
+      const reason: MediaSkipReason =
+        error instanceof QueueFullError
+          ? 'queue-full'
+          : error instanceof QueueTimeoutError
+            ? 'queue-timeout'
+            : 'download-failed';
+      this.logger.warn(
+        `Media download not started (${reason}) for message ${WhatsAppWebJsAdapter.logId(msg.id._serialized)}`,
+      );
+      return skipped(reason);
     }
 
     try {
@@ -489,6 +533,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         return skipped('download-failed');
       }
 
+      this.stats.downloads.completed += 1;
+      // base64 is 4 chars per 3 bytes; close enough to size a memory budget,
+      // and it does not require decoding the payload to measure it.
+      this.stats.downloads.bytes += size ?? Math.floor((media.data?.length ?? 0) * 0.75);
+
       return {
         mimetype: media.mimetype,
         filename: media.filename || undefined,
@@ -498,6 +547,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     } catch (error) {
       this.logger.error('Error downloading media', String(error));
       return skipped('download-failed');
+    } finally {
+      release();
     }
   }
 
@@ -510,6 +561,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   async processIncomingMessage(msg: WwebMessage): Promise<IncomingMessage | null> {
     const ignoredAs = this.getIgnoredSenderCategory(msg);
     if (ignoredAs) {
+      this.stats.ignored[ignoredAs] = (this.stats.ignored[ignoredAs] ?? 0) + 1;
       // The category, not the address: a filtered status still identifies a
       // contact, and counting it is all this needs to be useful.
       this.logger.debug(`Ignored inbound ${ignoredAs} message`);
@@ -519,7 +571,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // The `message` event is inbound-only today, but this keeps the session from
     // echoing its own sends if anything ever switches to `message_create`,
     // which does fire for them.
-    if (msg.fromMe) return null;
+    if (msg.fromMe) {
+      this.stats.ignored.fromMe = (this.stats.ignored.fromMe ?? 0) + 1;
+      return null;
+    }
+
+    this.stats.messagesDelivered += 1;
 
     const incomingMessage: IncomingMessage = {
       id: msg.id._serialized,
@@ -693,6 +750,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (this.destroyed) return;
     this.destroyed = true;
 
+    // Downloads queued behind a session that is going away would otherwise sit
+    // on their timeout and then call back into a torn-down session.
+    this.downloadSemaphore?.destroy();
+
     const client = this.client;
     this.client = null;
     this.qrCode = null;
@@ -716,6 +777,35 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     await this.hardKillBrowser();
+  }
+
+  /** Live download queue depth, for health endpoints and memory triage. */
+  getMediaDownloadStats(): SemaphoreStats {
+    return this.getDownloadSemaphore().stats;
+  }
+
+  /**
+   * Counters for what this session actually did with its inbound traffic.
+   *
+   * Deliberately counts and categories only - no ids, addresses or content -
+   * so the numbers can be logged and exposed without leaking who wrote in.
+   */
+  getInboundStats(): InboundStats {
+    const queue = this.getDownloadSemaphore().stats;
+
+    return {
+      messagesDelivered: this.stats.messagesDelivered,
+      ignored: { ...this.stats.ignored },
+      mediaSkipped: { ...this.stats.mediaSkipped },
+      downloads: {
+        active: queue.active,
+        waiting: queue.waiting,
+        concurrency: queue.concurrency,
+        queueMax: queue.queueMax,
+        completed: this.stats.downloads.completed,
+        bytes: this.stats.downloads.bytes,
+      },
+    };
   }
 
   getStatus(): EngineStatus {

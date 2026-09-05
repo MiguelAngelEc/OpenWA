@@ -7,6 +7,7 @@ import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { InboundStats } from '../../engine/interfaces/whatsapp-engine.interface';
 
 @ApiTags('sessions')
 @Controller('sessions')
@@ -205,6 +206,21 @@ export class SessionController {
   @ApiResponse({ status: 404, description: 'Session not found' })
   async getGroups(@Param('id') id: string): Promise<{ id: string; name: string }[]> {
     return this.sessionService.getGroups(id);
+  }
+
+  @Get(':id/inbound-stats')
+  @ApiOperation({
+    summary: 'Get inbound filtering and media download counters for a session',
+  })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Messages delivered, messages ignored by category, attachments skipped by reason, queue depth',
+  })
+  @ApiResponse({ status: 400, description: 'Session not running' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async getInboundStats(@Param('id') id: string): Promise<InboundStats> {
+    return this.sessionService.getInboundStats(id);
   }
 
   @Get('stats/overview')

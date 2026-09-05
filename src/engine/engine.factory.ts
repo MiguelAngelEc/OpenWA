@@ -77,6 +77,9 @@ export class EngineFactory implements OnModuleInit {
         maxBytes: this.configService.get<number>('engine.messages.media.maxBytes'),
         allowedTypes: this.configService.get<string[]>('engine.messages.media.allowedTypes'),
         unknownSizePolicy: this.configService.get<'skip' | 'download'>('engine.messages.media.unknownSizePolicy'),
+        concurrency: this.configService.get<number>('engine.messages.media.concurrency'),
+        queueMax: this.configService.get<number>('engine.messages.media.queueMax'),
+        queueTimeoutMs: this.configService.get<number>('engine.messages.media.queueTimeoutMs'),
       },
     };
   }

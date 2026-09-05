@@ -14,7 +14,12 @@ import * as path from 'path';
 import { Session, SessionStatus } from './entities/session.entity';
 import { CreateSessionDto } from './dto';
 import { EngineFactory } from '../../engine/engine.factory';
-import { IWhatsAppEngine, EngineStatus, DisconnectInfo } from '../../engine/interfaces/whatsapp-engine.interface';
+import {
+  IWhatsAppEngine,
+  EngineStatus,
+  DisconnectInfo,
+  InboundStats,
+} from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
@@ -526,6 +531,28 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     } finally {
       this.starting.delete(id);
     }
+  }
+
+  /**
+   * Inbound counters for a running session: what was filtered, what was
+   * downloaded, how deep the download queue is.
+   *
+   * @throws NotFoundException when the session does not exist.
+   * @throws BadRequestException when it is not running - the counters live in
+   *   the engine instance and reset with it, so there is nothing to report.
+   */
+  async getInboundStats(id: string): Promise<InboundStats> {
+    const session = await this.sessionRepository.findOne({ where: { id } });
+    if (!session) {
+      throw new NotFoundException(`Session with ID ${id} not found`);
+    }
+
+    const engine = this.engines.get(id);
+    if (!engine?.getInboundStats) {
+      throw new BadRequestException('Session is not running');
+    }
+
+    return engine.getInboundStats();
   }
 
   /**

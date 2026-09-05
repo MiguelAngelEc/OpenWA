@@ -39,6 +39,32 @@ export interface MediaInput {
 export type MediaSkipReason =
   'disabled' | 'too-large' | 'type-not-allowed' | 'unknown-size' | 'queue-full' | 'queue-timeout' | 'download-failed';
 
+/**
+ * What a session did with its inbound traffic since it started.
+ *
+ * Counts and categories only - no ids, addresses or content - so the numbers
+ * are safe to log and expose while still answering the questions that matter
+ * during a memory incident: what is being dropped, what is being downloaded,
+ * and how deep the queue is.
+ */
+export interface InboundStats {
+  /** Messages that passed every filter and reached the consumer. */
+  messagesDelivered: number;
+  /** Messages dropped, keyed by category (status, newsletter, broadcast, group, fromMe). */
+  ignored: Record<string, number>;
+  /** Attachments not delivered, keyed by MediaSkipReason. */
+  mediaSkipped: Record<string, number>;
+  downloads: {
+    active: number;
+    waiting: number;
+    concurrency: number;
+    queueMax: number;
+    completed: number;
+    /** Approximate bytes pulled from WhatsApp. */
+    bytes: number;
+  };
+}
+
 export interface IncomingMessage {
   id: string;
   from: string;
@@ -246,6 +272,8 @@ export interface IWhatsAppEngine {
 
   // Status
   getStatus(): EngineStatus;
+  /** Optional: inbound filtering and download counters, when the engine tracks them. */
+  getInboundStats?(): InboundStats;
   getQRCode(): string | null;
   getPhoneNumber(): string | null;
   getPushName(): string | null;
