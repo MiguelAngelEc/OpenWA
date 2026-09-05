@@ -20,6 +20,7 @@ import { LabelModule } from './modules/label/label.module';
 import { ChannelModule } from './modules/channel/channel.module';
 import { CacheModule } from './common/cache';
 import { StorageModule } from './common/storage/storage.module';
+import { MediaModule } from './modules/media/media.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { StatusModule } from './modules/status/status.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
@@ -140,6 +141,7 @@ if (process.env.QUEUE_ENABLED === 'true') {
     LoggerModule,
     CacheModule,
     StorageModule,
+    MediaModule, // Inbound media delivery (keeps base64 out of fanned-out payloads)
     AuditModule,
     EventsModule, // WebSocket real-time events
     ...queueModules,

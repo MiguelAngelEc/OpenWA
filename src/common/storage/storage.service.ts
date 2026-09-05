@@ -11,6 +11,7 @@ import {
   ListObjectsV2Command,
   GetObjectCommand,
   PutObjectCommand,
+  DeleteObjectCommand,
   HeadBucketCommand,
   CreateBucketCommand,
 } from '@aws-sdk/client-s3';
@@ -121,6 +122,29 @@ export class StorageService {
       return this.putS3File(filePath, data);
     }
     return this.putLocalFile(filePath, data);
+  }
+
+  /**
+   * Removes a file, treating "already gone" as success.
+   *
+   * Idempotent on purpose: the TTL sweep and an explicit delete can race, and a
+   * cleanup pass that throws on the second attempt would abort the rest of the
+   * sweep and leave expired files behind.
+   */
+  async deleteFile(filePath: string): Promise<void> {
+    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
+      return this.deleteS3File(filePath);
+    }
+    return this.deleteLocalFile(filePath);
+  }
+
+  async fileExists(filePath: string): Promise<boolean> {
+    try {
+      await this.getFile(filePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async getFileCount(): Promise<{ count: number; sizeBytes: number }> {
@@ -251,6 +275,18 @@ export class StorageService {
     return Promise.resolve(fs.readFileSync(fullPath));
   }
 
+  private deleteLocalFile(filePath: string): Promise<void> {
+    const fullPath = path.join(this.localPath, filePath);
+
+    try {
+      fs.rmSync(fullPath, { force: true });
+    } catch (error) {
+      this.logger.debug(`Failed to delete file: ${filePath}`, { error: String(error) });
+    }
+
+    return Promise.resolve();
+  }
+
   private putLocalFile(filePath: string, data: Buffer): Promise<void> {
     const fullPath = path.join(this.localPath, filePath);
     const dir = path.dirname(fullPath);
@@ -318,6 +354,21 @@ export class StorageService {
     }
 
     return Buffer.concat(chunks);
+  }
+
+  private async deleteS3File(filePath: string): Promise<void> {
+    if (!this.s3Client) return;
+
+    try {
+      await this.s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: this.s3Bucket,
+          Key: `media/${filePath}`,
+        }),
+      );
+    } catch (error) {
+      this.logger.debug(`Failed to delete S3 file: ${filePath}`, { error: String(error) });
+    }
   }
 
   private async putS3File(filePath: string, data: Buffer): Promise<void> {

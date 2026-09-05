@@ -18,8 +18,10 @@ import {
   IWhatsAppEngine,
   EngineStatus,
   DisconnectInfo,
+  IncomingMessage,
   InboundStats,
 } from '../../engine/interfaces/whatsapp-engine.interface';
+import { InboundMediaService } from '../media/inbound-media.service';
 import { createLogger } from '../../common/services/logger.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
@@ -59,6 +61,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     private readonly webhookService: WebhookService,
     private readonly hookManager: HookManager,
     private readonly configService: ConfigService,
+    private readonly inboundMediaService: InboundMediaService,
   ) {}
 
   /**
@@ -458,26 +461,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
           });
           // Update last active timestamp
           void this.sessionRepository.update(id, { lastActiveAt: new Date() });
-          // Convert IncomingMessage to plain object for dispatch
-          const messageData = { ...message };
 
-          // Execute hook for message received - plugins can modify or stop processing
-          void this.hookManager
-            .execute('message:received', messageData, {
-              sessionId: id,
-              source: 'Engine',
-            })
-            .then(({ continue: shouldContinue, data: finalMessage }) => {
-              if (!shouldContinue) {
-                // Plugin stopped processing (e.g., auto-reply handled it)
-                return;
-              }
-
-              // Dispatch to webhooks with potentially modified message
-              void this.webhookService.dispatch(id, 'message.received', finalMessage);
-              // Emit real-time event to WebSocket clients
-              this.eventsGateway.emitMessage(id, finalMessage);
-            });
+          void this.dispatchIncomingMessage(id, message);
         },
         onDisconnected: (reason: string, info?: DisconnectInfo): void => {
           this.logger.warn(`Session disconnected: ${reason}`, {
@@ -553,6 +538,36 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
     }
 
     return engine.getInboundStats();
+  }
+
+  /**
+   * Fans an inbound message out to plugins, webhooks and WebSocket clients.
+   *
+   * The delivery mode is applied first and deliberately: everything after this
+   * line copies the message - the spread, the hook chain, one JSON.stringify per
+   * webhook, the WebSocket frame - so an attachment must be turned into a
+   * reference before any of it, not after.
+   */
+  private async dispatchIncomingMessage(id: string, message: IncomingMessage): Promise<void> {
+    const delivered = await this.inboundMediaService.applyDeliveryMode(id, message);
+    const messageData = { ...delivered };
+
+    // Execute hook for message received - plugins can modify or stop processing
+    const { continue: shouldContinue, data: finalMessage } = await this.hookManager.execute(
+      'message:received',
+      messageData,
+      { sessionId: id, source: 'Engine' },
+    );
+
+    if (!shouldContinue) {
+      // Plugin stopped processing (e.g., auto-reply handled it)
+      return;
+    }
+
+    // Dispatch to webhooks with potentially modified message
+    void this.webhookService.dispatch(id, 'message.received', finalMessage);
+    // Emit real-time event to WebSocket clients
+    this.eventsGateway.emitMessage(id, finalMessage);
   }
 
   /**

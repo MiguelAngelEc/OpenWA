@@ -8,6 +8,7 @@ import { EngineFactory } from '../../engine/engine.factory';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
+import { InboundMediaService } from '../media/inbound-media.service';
 import { ConfigService } from '@nestjs/config';
 import { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 
@@ -37,6 +38,7 @@ describe('SessionService', () => {
   let eventsGateway: jest.Mocked<Partial<EventsGateway>>;
   let webhookService: jest.Mocked<Partial<WebhookService>>;
   let hookManager: jest.Mocked<Partial<HookManager>>;
+  let inboundMediaService: jest.Mocked<Partial<InboundMediaService>>;
   let configService: { get: jest.Mock };
   let mockEngine: Record<string, jest.Mock>;
 
@@ -87,6 +89,11 @@ describe('SessionService', () => {
       execute: jest.fn().mockResolvedValue({ continue: true, data: {} }),
     };
 
+    inboundMediaService = {
+      // Default to the pass-through contract of `inline` mode.
+      applyDeliveryMode: jest.fn().mockImplementation((_id: string, message: unknown) => Promise.resolve(message)),
+    };
+
     configService = {
       get: jest.fn((key: string, fallback?: unknown) => {
         const values: Record<string, unknown> = {
@@ -115,6 +122,7 @@ describe('SessionService', () => {
         { provide: WebhookService, useValue: webhookService },
         { provide: HookManager, useValue: hookManager },
         { provide: ConfigService, useValue: configService },
+        { provide: InboundMediaService, useValue: inboundMediaService },
       ],
     }).compile();
 

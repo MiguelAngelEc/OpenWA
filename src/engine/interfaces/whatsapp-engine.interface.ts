@@ -35,9 +35,17 @@ export interface MediaInput {
  * - `queue-full`       too many downloads were already waiting
  * - `queue-timeout`    no download slot became free in time
  * - `download-failed`  WhatsApp refused or returned nothing
+ * - `storage-failed`   the file downloaded but could not be persisted
  */
 export type MediaSkipReason =
-  'disabled' | 'too-large' | 'type-not-allowed' | 'unknown-size' | 'queue-full' | 'queue-timeout' | 'download-failed';
+  | 'disabled'
+  | 'too-large'
+  | 'type-not-allowed'
+  | 'unknown-size'
+  | 'queue-full'
+  | 'queue-timeout'
+  | 'download-failed'
+  | 'storage-failed';
 
 /**
  * What a session did with its inbound traffic since it started.
@@ -78,12 +86,19 @@ export interface IncomingMessage {
   media?: {
     mimetype?: string;
     filename?: string;
-    data?: string; // base64
+    /** base64. Absent in `storage` and `none` delivery modes. */
+    data?: string;
     /** Byte count reported by WhatsApp; present even when the download was skipped. */
     size?: number;
-    /** True when the attachment was not downloaded. `data` is absent. */
+    /** True when the attachment was not downloaded, or not delivered. `data` is absent. */
     skipped?: boolean;
     skipReason?: MediaSkipReason;
+    /** `storage` mode: where the file was persisted. */
+    storageKey?: string;
+    /** `storage` mode: authenticated download path for the file. */
+    url?: string;
+    /** `storage` mode: ISO timestamp after which the file is gone. */
+    expiresAt?: string;
   };
   quotedMessage?: {
     id: string;

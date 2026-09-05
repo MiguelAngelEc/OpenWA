@@ -123,6 +123,38 @@ export default () => ({
           { min: 1 },
         ),
       },
+      // How a downloaded attachment reaches hooks, webhooks, the queue and the
+      // WebSocket.
+      //
+      // `inline` keeps base64 in the payload - the existing contract, and the
+      // reason one attachment is copied by every consumer. `storage` persists it
+      // once and distributes a reference instead. `none` drops the payload after
+      // the download, for consumers that only need to know a file arrived.
+      delivery: {
+        mode: parseEnum(
+          'MEDIA_DELIVERY_MODE',
+          process.env.MEDIA_DELIVERY_MODE,
+          ['inline', 'storage', 'none'] as const,
+          'inline',
+        ),
+        ttlSeconds: parseInteger('MEDIA_STORAGE_TTL_SECONDS', process.env.MEDIA_STORAGE_TTL_SECONDS, 86400, { min: 1 }),
+        // What to do when persisting fails. `skip` keeps the memory guarantee -
+        // falling back to base64 would reintroduce the spike precisely when the
+        // system is already under stress.
+        failurePolicy: parseEnum(
+          'MEDIA_STORAGE_FAILURE_POLICY',
+          process.env.MEDIA_STORAGE_FAILURE_POLICY,
+          ['skip', 'inline'] as const,
+          'skip',
+        ),
+        // How often expired attachments are swept from storage.
+        cleanupIntervalSeconds: parseInteger(
+          'MEDIA_STORAGE_CLEANUP_INTERVAL_SECONDS',
+          process.env.MEDIA_STORAGE_CLEANUP_INTERVAL_SECONDS,
+          3600,
+          { min: 60 },
+        ),
+      },
     },
   },
 
