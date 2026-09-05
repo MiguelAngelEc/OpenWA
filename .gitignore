@@ -44,9 +44,11 @@ Thumbs.db
 *.sublime-project
 
 # Data and storage
-data/
-media/
-uploads/
+# Anchored to the repo root: unanchored `media/` matched any directory of that
+# name at any depth, which silently excluded src/modules/media from the index.
+/data/
+/media/
+/uploads/
 .wwebjs_auth/
 .wwebjs_cache/
 
@@ -58,10 +60,25 @@ uploads/
 # Docker
 .docker/
 
+# Secrets and credentials
+# The Dashboard writes resolved configuration - API keys included - to
+# data/.env.generated. data/ is already ignored, but the pattern is repeated
+# here so a relocated STORAGE_PATH cannot leak one into a commit.
+.env.generated
+*.env.generated
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
 # Misc
 *.bak
 *.tmp
 *.temp
+*.orig
+*.rej
 
 # Git worktrees
 .worktrees/
@@ -72,3 +89,14 @@ uploads/
 docs/plans/
 CLAUDE.md
 _docs/
+
+# Local planning and scratch notes
+# Working documents for a single machine or a single change; they go stale the
+# moment the work lands, so they stay out of the history.
+PLAN.md
+PLAN-*.md
+*.plan.md
+TODO.md
+NOTES.md
+SCRATCH.md
+.scratch/
