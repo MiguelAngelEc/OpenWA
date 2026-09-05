@@ -14,7 +14,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package files
+# scripts/ comes along because postinstall lives there. The dashboard is not
+# copied at this point and the script is written to skip it, which is what
+# keeps this dependency layer cacheable.
 COPY package*.json ./
+COPY scripts ./scripts
 
 # Install all dependencies (including devDependencies for build)
 RUN npm ci
@@ -60,8 +64,9 @@ RUN groupadd -r openwa && useradd -r -g openwa openwa
 
 WORKDIR /app
 
-# Copy package files
+# Copy package files (scripts/ carries postinstall)
 COPY package*.json ./
+COPY scripts ./scripts
 
 # Install production dependencies only
 RUN npm ci --omit=dev && npm cache clean --force
