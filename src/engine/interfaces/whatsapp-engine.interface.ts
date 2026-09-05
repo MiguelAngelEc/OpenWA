@@ -194,12 +194,23 @@ export interface PaginatedProducts {
   };
 }
 
+export interface DisconnectInfo {
+  reason: string;
+  /**
+   * True when WhatsApp invalidated the credentials (logout from the phone,
+   * account banned, auth failure). The stored session is dead: reconnecting
+   * with it produces neither `ready` nor a QR, so the caller must wipe the
+   * auth data before re-initializing.
+   */
+  requiresReauth: boolean;
+}
+
 export interface EngineEventCallbacks {
   onQRCode?: (qr: string) => void;
   onReady?: (phone: string, pushName: string) => void;
   onMessage?: (message: IncomingMessage) => void;
   onMessageAck?: (messageId: string, ack: number) => void;
-  onDisconnected?: (reason: string) => void;
+  onDisconnected?: (reason: string, info?: DisconnectInfo) => void;
   onStateChanged?: (state: EngineStatus) => void;
 }
 
@@ -209,6 +220,7 @@ export interface IWhatsAppEngine {
   disconnect(): Promise<void>; // Closes browser but keeps session (can reconnect without QR)
   logout(): Promise<void>; // Logs out and clears session data (requires QR scan again)
   destroy(): Promise<void>;
+  clearAuthData?(): Promise<void>; // Deletes stored credentials so the next initialize() shows a QR
 
   // Status
   getStatus(): EngineStatus;

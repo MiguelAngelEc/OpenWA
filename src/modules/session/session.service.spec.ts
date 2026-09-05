@@ -8,6 +8,8 @@ import { EngineFactory } from '../../engine/engine.factory';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
+import { ConfigService } from '@nestjs/config';
+import { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 
 function createMockSession(overrides: Partial<Session> = {}): Session {
   return {
@@ -35,6 +37,7 @@ describe('SessionService', () => {
   let eventsGateway: jest.Mocked<Partial<EventsGateway>>;
   let webhookService: jest.Mocked<Partial<WebhookService>>;
   let hookManager: jest.Mocked<Partial<HookManager>>;
+  let configService: { get: jest.Mock };
   let mockEngine: Record<string, jest.Mock>;
 
   beforeEach(async () => {
@@ -63,6 +66,7 @@ describe('SessionService', () => {
       destroy: jest.fn().mockResolvedValue(undefined),
       disconnect: jest.fn().mockResolvedValue(undefined),
       getQRCode: jest.fn().mockReturnValue(null),
+      getStatus: jest.fn().mockReturnValue(EngineStatus.QR_READY),
       getGroups: jest.fn().mockResolvedValue([]),
     };
 
@@ -83,6 +87,18 @@ describe('SessionService', () => {
       execute: jest.fn().mockResolvedValue({ continue: true, data: {} }),
     };
 
+    configService = {
+      get: jest.fn((key: string, fallback?: unknown) => {
+        const values: Record<string, unknown> = {
+          'engine.sessionDataPath': './data/sessions',
+          'engine.autoRestore': false,
+          'engine.autoRestoreDelay': 0,
+          'engine.qrWaitTimeout': 0,
+        };
+        return key in values ? values[key] : fallback;
+      }),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SessionService,
@@ -98,6 +114,7 @@ describe('SessionService', () => {
         { provide: EventsGateway, useValue: eventsGateway },
         { provide: WebhookService, useValue: webhookService },
         { provide: HookManager, useValue: hookManager },
+        { provide: ConfigService, useValue: configService },
       ],
     }).compile();
 
@@ -243,13 +260,85 @@ describe('SessionService', () => {
       (repository.findOne as jest.Mock).mockResolvedValue(session);
       (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
 
-      await service.start('sess-uuid-1');
+      await service.start('sess-uuid-1', { wait: true });
 
       expect(hookManager.execute).toHaveBeenCalledWith(
         'session:starting',
         expect.objectContaining({ sessionId: 'sess-uuid-1' }),
         expect.any(Object),
       );
+    });
+  });
+
+  // ── restart / recovery ────────────────────────────────────────────
+
+  describe('restart and recovery', () => {
+    it('should replace a dead engine instead of refusing to start', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      // Engine died (Chromium crash, failed init): it is still in the map but
+      // no longer usable.
+      mockEngine.getStatus.mockReturnValue(EngineStatus.FAILED);
+
+      await expect(service.start('sess-uuid-1')).resolves.toBeDefined();
+      expect(mockEngine.destroy).toHaveBeenCalled();
+      expect(engineFactory.create).toHaveBeenCalledTimes(2);
+    });
+
+    it('should drop the engine from the map when initialize() fails', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      mockEngine.initialize.mockRejectedValueOnce(new Error('Chromium launch failed'));
+
+      await expect(service.start('sess-uuid-1', { wait: true })).rejects.toThrow('Chromium launch failed');
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+
+      // A retry must not hit "Session is already started"
+      mockEngine.initialize.mockResolvedValue(undefined);
+      await expect(service.start('sess-uuid-1')).resolves.toBeDefined();
+    });
+
+    it('should tear the engine down and restart it', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      await service.restart('sess-uuid-1');
+
+      expect(mockEngine.destroy).toHaveBeenCalled();
+      expect(engineFactory.create).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('start (non-blocking)', () => {
+    it('should return without waiting for the engine to finish initializing', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      let releaseInit: (() => void) | undefined;
+      mockEngine.initialize.mockImplementationOnce(
+        () =>
+          new Promise<void>(resolve => {
+            releaseInit = resolve;
+          }),
+      );
+
+      await service.start('sess-uuid-1');
+
+      // Engine registered and reported as active even though initialize() is
+      // still pending - this is what keeps POST /start from hanging.
+      expect(service.isActive('sess-uuid-1')).toBe(true);
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', {
+        status: SessionStatus.INITIALIZING,
+      });
+
+      releaseInit?.();
     });
   });
 
@@ -304,6 +393,7 @@ describe('SessionService', () => {
 
       await service.start('sess-uuid-1');
       mockEngine.getQRCode.mockReturnValue(null);
+      mockEngine.getStatus.mockReturnValue(EngineStatus.READY);
 
       await expect(service.getQRCode('sess-uuid-1')).rejects.toThrow('already authenticated');
     });

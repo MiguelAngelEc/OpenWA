@@ -1,5 +1,5 @@
-import { Controller, Get, Post, Delete, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
+import { Controller, Get, Post, Delete, Param, Body, Query, HttpCode, HttpStatus } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/swagger';
 import { SessionService } from './session.service';
 import { CreateSessionDto, SessionResponseDto, QRCodeResponseDto } from './dto';
 import { Session } from './entities/session.entity';
@@ -104,8 +104,13 @@ export class SessionController {
   })
   @ApiResponse({ status: 400, description: 'Session already started' })
   @ApiResponse({ status: 404, description: 'Session not found' })
-  async start(@Param('id') id: string): Promise<SessionResponseDto> {
-    const session = await this.sessionService.start(id);
+  @ApiQuery({
+    name: 'force',
+    required: false,
+    description: 'Replace an existing engine instead of failing with "already started"',
+  })
+  async start(@Param('id') id: string, @Query('force') force?: string): Promise<SessionResponseDto> {
+    const session = await this.sessionService.start(id, { force: force === 'true' || force === '1' });
     await this.auditService.logInfo(AuditAction.SESSION_STARTED, {
       sessionId: session.id,
       sessionName: session.name,
@@ -132,9 +137,42 @@ export class SessionController {
     return this.transformSession(session);
   }
 
-  @Get(':id/qr')
-  @ApiOperation({ summary: 'Get QR code for session authentication' })
+  @Post(':id/restart')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({
+    summary: 'Restart a session (always tears the engine down first)',
+    description:
+      'Use this when a session is stuck. Pass clearAuth=true to also delete the stored ' +
+      'credentials, which forces a fresh QR without having to recreate the session.',
+  })
   @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiQuery({
+    name: 'clearAuth',
+    required: false,
+    description: 'Delete stored credentials so a new QR is generated',
+  })
+  @ApiResponse({ status: 200, description: 'Session restarted', type: SessionResponseDto })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async restart(@Param('id') id: string, @Query('clearAuth') clearAuth?: string): Promise<SessionResponseDto> {
+    const session = await this.sessionService.restart(id, {
+      clearAuth: clearAuth === 'true' || clearAuth === '1',
+    });
+    await this.auditService.logInfo(AuditAction.SESSION_STARTED, {
+      sessionId: session.id,
+      sessionName: session.name,
+    });
+    return this.transformSession(session);
+  }
+
+  @Get(':id/qr')
+  @ApiOperation({
+    summary: 'Get QR code for session authentication',
+    description:
+      'Starts the session if it is not running and waits for the first QR (default 30s) ' +
+      'instead of returning 400 while the engine is still booting.',
+  })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiQuery({ name: 'wait', required: false, description: 'Milliseconds to wait for the QR (0 = no wait)' })
   @ApiResponse({
     status: 200,
     description: 'QR code data',
@@ -145,8 +183,11 @@ export class SessionController {
     description: 'QR code not ready or session already authenticated',
   })
   @ApiResponse({ status: 404, description: 'Session not found' })
-  async getQRCode(@Param('id') id: string): Promise<QRCodeResponseDto> {
-    const qrCode = await this.sessionService.getQRCode(id);
+  async getQRCode(@Param('id') id: string, @Query('wait') wait?: string): Promise<QRCodeResponseDto> {
+    const waitMs = wait === undefined ? undefined : Number.parseInt(wait, 10);
+    const qrCode = await this.sessionService.getQRCode(id, {
+      waitMs: Number.isFinite(waitMs) ? waitMs : undefined,
+    });
     await this.auditService.logInfo(AuditAction.SESSION_QR_GENERATED, {
       sessionId: id,
     });

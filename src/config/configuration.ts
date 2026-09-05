@@ -53,6 +53,16 @@ export default () => ({
       args: (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox').split(','),
     },
     sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
+    // Re-open sessions that were connected before the process stopped, so an
+    // API restart does not require a manual POST /sessions/:id/start.
+    autoRestore: process.env.SESSION_AUTO_RESTORE !== 'false',
+    // Delay before the restore sweep runs, giving the HTTP server time to bind.
+    autoRestoreDelay: parseInt(process.env.SESSION_AUTO_RESTORE_DELAY || '3000', 10),
+    // Hard cap for a single engine.initialize() call. Without it a Chromium
+    // launch that never resolves leaves the session stuck in `initializing`.
+    initTimeout: parseInt(process.env.SESSION_INIT_TIMEOUT || '90000', 10),
+    // How long GET /sessions/:id/qr waits for the first QR before giving up.
+    qrWaitTimeout: parseInt(process.env.SESSION_QR_WAIT_TIMEOUT || '30000', 10),
   },
 
   // Webhook configuration

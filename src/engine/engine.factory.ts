@@ -69,6 +69,14 @@ export class EngineFactory implements OnModuleInit {
         sessionId: options.sessionId,
         proxyUrl: options.proxyUrl,
         proxyType: options.proxyType,
+        // The plugin context carries no runtime config, so the resolved engine
+        // settings must be passed explicitly; otherwise the plugin falls back
+        // to './data/sessions' and writes credentials somewhere the session
+        // layer never looks when it has to wipe them.
+        sessionDataPath: this.configService.get<string>('engine.sessionDataPath') ?? './data/sessions',
+        headless: this.configService.get<boolean>('engine.puppeteer.headless') ?? true,
+        puppeteerArgs: this.configService.get<string[]>('engine.puppeteer.args'),
+        initTimeout: this.configService.get<number>('engine.initTimeout') ?? 90000,
       }) as IWhatsAppEngine;
     }
 
@@ -85,7 +93,7 @@ export class EngineFactory implements OnModuleInit {
       typeof instance === 'object' &&
       instance !== null &&
       'type' in instance &&
-      (instance as { type: unknown }).type === PluginType.ENGINE &&
+      instance.type === PluginType.ENGINE &&
       'createEngine' in instance &&
       typeof (instance as { createEngine: unknown }).createEngine === 'function'
     );
@@ -106,6 +114,7 @@ export class EngineFactory implements OnModuleInit {
             type: options.proxyType ?? 'http',
           }
         : undefined,
+      initTimeout: this.configService.get<number>('engine.initTimeout') ?? 90000,
     });
   }
 

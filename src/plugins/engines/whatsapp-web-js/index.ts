@@ -11,6 +11,7 @@ export interface WhatsAppWebJsConfig {
   sessionDataPath?: string;
   headless?: boolean;
   puppeteerArgs?: string[];
+  initTimeout?: number;
 }
 
 export class WhatsAppWebJsPlugin implements IEnginePlugin {
@@ -35,12 +36,14 @@ export class WhatsAppWebJsPlugin implements IEnginePlugin {
 
   createEngine(config: Record<string, unknown>): IWhatsAppEngine {
     const sessionId = config.sessionId as string;
-    const sessionDataPath = (this.context?.config.sessionDataPath as string) ?? './data/sessions';
-    const headless = (this.context?.config.headless as boolean) ?? true;
-    const puppeteerArgs = (this.context?.config.puppeteerArgs as string[]) ?? [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-    ];
+    // Caller-supplied values win: they come from the resolved app config, while
+    // the plugin context only holds whatever the plugin registry stored.
+    const sessionDataPath =
+      (config.sessionDataPath as string) ?? (this.context?.config.sessionDataPath as string) ?? './data/sessions';
+    const headless = (config.headless as boolean) ?? (this.context?.config.headless as boolean) ?? true;
+    const puppeteerArgs = (config.puppeteerArgs as string[]) ??
+      (this.context?.config.puppeteerArgs as string[]) ?? ['--no-sandbox', '--disable-setuid-sandbox'];
+    const initTimeout = (config.initTimeout as number) ?? (this.context?.config.initTimeout as number) ?? 90000;
 
     const proxyUrl = config.proxyUrl as string | undefined;
     const proxyType = config.proxyType as 'http' | 'https' | 'socks4' | 'socks5' | undefined;
@@ -58,6 +61,7 @@ export class WhatsAppWebJsPlugin implements IEnginePlugin {
             type: proxyType ?? 'http',
           }
         : undefined,
+      initTimeout,
     });
   }
 

@@ -1,11 +1,14 @@
 import { EventEmitter } from 'events';
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
+import { Client, LocalAuth, MessageMedia, Message as WwebMessage } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
+import { promises as fs } from 'fs';
+import { execFile } from 'child_process';
 import {
   IWhatsAppEngine,
   EngineStatus,
   EngineEventCallbacks,
+  DisconnectInfo,
   MessageResult,
   MediaInput,
   IncomingMessage,
@@ -48,6 +51,8 @@ export interface WhatsAppWebJsConfig {
     url: string;
     type: 'http' | 'https' | 'socks4' | 'socks5';
   };
+  /** Hard cap for initialize(); 0 disables the timeout. */
+  initTimeout?: number;
 }
 
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
@@ -57,6 +62,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private phoneNumber: string | null = null;
   private pushName: string | null = null;
   private callbacks: EngineEventCallbacks = {};
+  private destroyed = false;
+  private browserPid: number | null = null;
+  private pidTracker: NodeJS.Timeout | null = null;
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
@@ -64,11 +72,183 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   private readonly logger = createLogger('WhatsAppWebJsAdapter');
 
+  /**
+   * Absolute folder LocalAuth uses for this session's Chromium profile.
+   * Kept public so the session layer can wipe credentials after a logout
+   * without having to re-derive the path (and get it wrong).
+   */
+  getAuthDir(): string {
+    return path.resolve(this.config.sessionDataPath, `session-${this.config.sessionId}`);
+  }
+
+  /**
+   * File holding the PID of the Chromium we spawned. Chromium outlives the API
+   * whenever the process is killed without a clean shutdown (SIGKILL, a crash,
+   * a watcher restart). The orphan keeps the profile locked, so the next launch
+   * waits forever for a debug port it will never get - the session then sits in
+   * `initializing` with no QR. Persisting the PID is what lets the next boot
+   * kill it.
+   */
+  private getPidFile(): string {
+    return path.resolve(this.config.sessionDataPath, `session-${this.config.sessionId}.pid`);
+  }
+
+  private static isAlive(pid: number): boolean {
+    try {
+      // Signal 0 performs the existence check without signalling.
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Image name of a running process, used to avoid killing a recycled PID. */
+  private static getProcessName(pid: number): Promise<string> {
+    const cmd = process.platform === 'win32' ? 'tasklist' : 'ps';
+    const args =
+      process.platform === 'win32' ? ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'] : ['-p', String(pid), '-o', 'comm='];
+
+    return new Promise<string>(resolve => {
+      execFile(cmd, args, { timeout: 5000 }, (error, stdout) => {
+        resolve(error ? '' : String(stdout).toLowerCase());
+      });
+    });
+  }
+
+  private static killProcessTree(pid: number): Promise<void> {
+    if (process.platform === 'win32') {
+      // Chromium spawns renderer/GPU children; /T takes the whole tree.
+      return new Promise<void>(resolve => {
+        execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 10000 }, () => resolve());
+      });
+    }
+
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+    return Promise.resolve();
+  }
+
+  /**
+   * Kill a Chromium left behind by a previous run before touching the profile.
+   * Only a process that is still alive AND still looks like a browser is
+   * killed, so a recycled PID cannot take down something unrelated.
+   */
+  private async killStaleBrowser(): Promise<void> {
+    const pidFile = this.getPidFile();
+
+    let pid: number;
+    try {
+      pid = Number.parseInt(await fs.readFile(pidFile, 'utf8'), 10);
+    } catch {
+      return; // no previous run recorded
+    }
+
+    if (!Number.isInteger(pid) || pid <= 0 || !WhatsAppWebJsAdapter.isAlive(pid)) {
+      await fs.rm(pidFile, { force: true }).catch(() => undefined);
+      return;
+    }
+
+    const name = await WhatsAppWebJsAdapter.getProcessName(pid);
+    if (!/chrom/.test(name)) {
+      this.logger.warn(`PID ${pid} is not a browser (${name.trim() || 'unknown'}); leaving it alone`);
+      await fs.rm(pidFile, { force: true }).catch(() => undefined);
+      return;
+    }
+
+    this.logger.warn(`Killing orphaned browser from a previous run (pid ${pid})`);
+    await WhatsAppWebJsAdapter.killProcessTree(pid);
+    await fs.rm(pidFile, { force: true }).catch(() => undefined);
+  }
+
+  /**
+   * whatsapp-web.js exposes the browser only after launch, so poll briefly to
+   * record its PID. Without it a later hard kill has no target.
+   */
+  private trackBrowserPid(): void {
+    const deadline = Date.now() + 60000;
+
+    const poll = (): void => {
+      const pid = this.client?.pupBrowser?.process()?.pid;
+      if (pid) {
+        this.browserPid = pid;
+        void fs.writeFile(this.getPidFile(), String(pid), 'utf8').catch(() => undefined);
+        return;
+      }
+      if (Date.now() > deadline || this.destroyed) return;
+      this.pidTracker = setTimeout(poll, 250);
+      this.pidTracker.unref?.();
+    };
+
+    poll();
+  }
+
+  /** Last resort when client.destroy() hangs or was never reached. */
+  private async hardKillBrowser(): Promise<void> {
+    if (this.pidTracker) {
+      clearTimeout(this.pidTracker);
+      this.pidTracker = null;
+    }
+
+    const pid = this.browserPid;
+    this.browserPid = null;
+
+    if (pid && WhatsAppWebJsAdapter.isAlive(pid)) {
+      this.logger.warn(`Force killing browser process ${pid}`);
+      await WhatsAppWebJsAdapter.killProcessTree(pid);
+    }
+
+    await fs.rm(this.getPidFile(), { force: true }).catch(() => undefined);
+  }
+
+  /**
+   * Chromium refuses to reuse a profile that still holds the singleton locks a
+   * previous run left behind. An API killed with SIGKILL (docker kill, crash,
+   * a second Ctrl+C) always leaves them, and the next launch then hangs before
+   * WhatsApp Web loads - so no `qr` and no `ready` event ever fires and the
+   * session sits in `initializing` forever. Clearing them is safe: if another
+   * live Chromium really owned this profile we would not be initializing.
+   */
+  private async clearProfileLocks(): Promise<void> {
+    const authDir = this.getAuthDir();
+    const locks = ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'DevToolsActivePort'];
+
+    for (const lock of locks) {
+      try {
+        await fs.rm(path.join(authDir, lock), { force: true, recursive: true });
+      } catch (error) {
+        this.logger.debug(`Could not remove profile lock ${lock}: ${String(error)}`);
+      }
+    }
+  }
+
+  /** Delete the stored credentials so the next initialize() yields a fresh QR. */
+  async clearAuthData(): Promise<void> {
+    const authDir = this.getAuthDir();
+    try {
+      await fs.rm(authDir, { recursive: true, force: true });
+      this.logger.log(`Auth data cleared: ${authDir}`);
+    } catch (error) {
+      this.logger.warn(`Could not clear auth data: ${authDir}`, String(error));
+    }
+  }
+
   async initialize(callbacks: EngineEventCallbacks): Promise<void> {
     this.callbacks = callbacks;
+    this.destroyed = false;
+    this.qrCode = null;
     this.setStatus(EngineStatus.INITIALIZING);
 
     try {
+      // Order matters: kill the previous browser BEFORE deleting the lock
+      // files, otherwise a live Chromium keeps owning the profile while its
+      // evidence is gone, and the new launch blocks on the debug port.
+      await this.killStaleBrowser();
+      await this.clearProfileLocks();
+
       // Build puppeteer args, including proxy if configured
       const puppeteerArgs = this.config.puppeteer?.args || [
         '--no-sandbox',
@@ -97,13 +277,48 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           headless: this.config.puppeteer?.headless ?? true,
           args: puppeteerArgs,
         },
+        // Reclaim the WhatsApp Web slot instead of dying when the same account
+        // is open elsewhere - otherwise a stale tab keeps the session offline.
+        takeoverOnConflict: true,
+        takeoverTimeoutMs: 10000,
       });
 
       this.setupEventHandlers();
-      await this.client.initialize();
+      const initPromise = this.client.initialize();
+      this.trackBrowserPid();
+      await this.withInitTimeout(initPromise);
+
+      if (this.pidTracker) {
+        clearTimeout(this.pidTracker);
+        this.pidTracker = null;
+      }
     } catch (error) {
       this.setStatus(EngineStatus.FAILED);
+      // A half-open Chromium keeps the profile locked and blocks every retry.
+      await this.destroy().catch(() => undefined);
       throw error;
+    }
+  }
+
+  /**
+   * client.initialize() can hang indefinitely (dead profile, no network to
+   * web.whatsapp.com, Chromium that never exposes its debug port). Fail loudly
+   * instead, so the caller can clean up and retry.
+   */
+  private async withInitTimeout<T>(promise: Promise<T>): Promise<T> {
+    const timeout = this.config.initTimeout ?? 90000;
+    if (timeout <= 0) return promise;
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Engine initialize timed out after ${timeout}ms`)), timeout);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -194,15 +409,46 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       this.callbacks.onMessageAck?.(msg.id._serialized, ack);
     });
 
-    this.client.on('disconnected', reason => {
-      this.setStatus(EngineStatus.DISCONNECTED);
-      this.callbacks.onDisconnected?.(reason);
+    this.client.on('loading_screen', (percent, message) => {
+      this.logger.debug(`Loading WhatsApp Web: ${String(percent)}% ${String(message)}`);
     });
 
-    this.client.on('auth_failure', () => {
-      this.setStatus(EngineStatus.FAILED);
-      this.callbacks.onDisconnected?.('Authentication failed');
+    this.client.on('change_state', state => {
+      this.logger.debug(`Client state changed: ${String(state)}`);
     });
+
+    this.client.on('disconnected', reason => {
+      const info: DisconnectInfo = {
+        reason: String(reason),
+        requiresReauth: WhatsAppWebJsAdapter.isReauthReason(String(reason)),
+      };
+      this.qrCode = null;
+      this.setStatus(EngineStatus.DISCONNECTED);
+      // The Chromium instance survives a `disconnected` event and keeps the
+      // profile locked, which is what makes the next start() produce no QR.
+      void this.destroy().catch(() => undefined);
+      this.callbacks.onDisconnected?.(info.reason, info);
+    });
+
+    this.client.on('auth_failure', message => {
+      this.qrCode = null;
+      this.setStatus(EngineStatus.FAILED);
+      void this.destroy().catch(() => undefined);
+      this.callbacks.onDisconnected?.(`Authentication failed: ${String(message ?? '')}`.trim(), {
+        reason: 'AUTH_FAILURE',
+        requiresReauth: true,
+      });
+    });
+  }
+
+  /**
+   * Reasons whatsapp-web.js reports when the stored credentials are no longer
+   * usable. Reconnecting with the same LocalAuth folder then silently stalls,
+   * so these must trigger an auth wipe rather than a plain retry.
+   */
+  private static isReauthReason(reason: string): boolean {
+    const upper = reason.toUpperCase();
+    return ['LOGOUT', 'UNPAIRED', 'UNPAIRED_IDLE', 'UNLAUNCHED', 'BANNED', 'CONFLICT'].some(r => upper.includes(r));
   }
 
   private setStatus(status: EngineStatus): void {
@@ -222,6 +468,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         // Already destroyed or not initialized - ignore
       }
       this.client = null;
+      this.destroyed = true;
+      await this.hardKillBrowser();
       this.setStatus(EngineStatus.DISCONNECTED);
     }
   }
@@ -241,16 +489,39 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         }
       }
       this.client = null;
+      this.destroyed = true;
+      await this.hardKillBrowser();
       this.setStatus(EngineStatus.DISCONNECTED);
     }
   }
 
   async destroy(): Promise<void> {
-    if (this.client) {
-      await this.client.destroy();
-      this.client = null;
+    if (this.destroyed) return;
+    this.destroyed = true;
+
+    const client = this.client;
+    this.client = null;
+    this.qrCode = null;
+
+    if (client) {
+      try {
+        // client.destroy() talks to a page that may already be unresponsive;
+        // without a bound it hangs and takes the whole teardown with it.
+        await Promise.race([
+          client.destroy(),
+          new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, 10000);
+            timer.unref?.();
+          }),
+        ]);
+      } catch (error) {
+        // Chromium may already be gone; the hard kill below is the backstop.
+        this.logger.warn('Client destroy failed', String(error));
+      }
       this.setStatus(EngineStatus.DISCONNECTED);
     }
+
+    await this.hardKillBrowser();
   }
 
   getStatus(): EngineStatus {
@@ -269,13 +540,26 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.pushName;
   }
 
+  /**
+   * whatsapp-web.js can resolve sendMessage() with an undefined model even when
+   * the message was delivered, which used to surface as a 500 on every send
+   * endpoint. Treat a missing model as a successful send with an unknown id.
+   */
+  private toMessageResult(msg?: WwebMessage): MessageResult {
+    const id = msg?.id?._serialized;
+
+    if (!id) {
+      this.logger.warn('sendMessage resolved without a message model; reporting send as accepted');
+      return { id: '', timestamp: Math.floor(Date.now() / 1000) };
+    }
+
+    return { id, timestamp: msg.timestamp };
+  }
+
   async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
     this.ensureReady();
     const msg = await this.client!.sendMessage(chatId, text);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.toMessageResult(msg);
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -316,10 +600,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       caption: media.caption,
     });
 
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.toMessageResult(msg);
   }
 
   async getContacts(): Promise<Contact[]> {
@@ -362,7 +643,19 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async getGroups(): Promise<Group[]> {
     this.ensureReady();
-    const chats = await this.client!.getChats();
+
+    let chats;
+    try {
+      chats = await this.client!.getChats();
+    } catch (error) {
+      // client.getChats() serializes EVERY chat through one Promise.all, so a
+      // single unserializable chat (a group whose metadata lookup hits
+      // "Failed to execute 'get' on 'IDBObjectStore'") fails the whole listing
+      // and the endpoint answers 500. Fall back to reading the group chats
+      // straight off the collection, tolerating the bad ones.
+      this.logger.warn(`getChats failed, falling back to direct group enumeration: ${String(error)}`);
+      return this.getGroupsFallback();
+    }
 
     // Filter only group chats
     const groups = chats.filter(chat => chat.isGroup);
@@ -380,6 +673,53 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     });
   }
 
+  /**
+   * Minimal, failure-tolerant group listing read directly from WhatsApp Web's
+   * chat collection. Chats that cannot be read are skipped instead of taking
+   * the whole response down with them.
+   */
+  private async getGroupsFallback(): Promise<Group[]> {
+    const page = this.client?.pupPage;
+    if (!page) {
+      throw new Error('WhatsApp client is not ready');
+    }
+
+    const groups = await page.evaluate(() => {
+      const collections = (window as unknown as { require: (m: string) => unknown }).require('WAWebCollections') as {
+        Chat: { getModelsArray: () => unknown[] };
+      };
+
+      const result: Array<{ id: string; name: string; participantsCount?: number }> = [];
+
+      for (const raw of collections.Chat.getModelsArray()) {
+        try {
+          const chat = raw as {
+            id?: { _serialized?: string; server?: string };
+            name?: string;
+            formattedTitle?: string;
+            groupMetadata?: { participants?: { getModelsArray?: () => unknown[] } };
+          };
+
+          const id = chat.id?._serialized;
+          if (!id || chat.id?.server !== 'g.us') continue;
+
+          result.push({
+            id,
+            name: chat.name || chat.formattedTitle || id,
+            participantsCount: chat.groupMetadata?.participants?.getModelsArray?.().length,
+          });
+        } catch {
+          // skip the chat we cannot read
+        }
+      }
+
+      return result;
+    });
+
+    this.logger.log(`Group fallback returned ${groups.length} group(s)`);
+    return groups;
+  }
+
   // ============= Phase 3: Extended Messaging =============
 
   async sendLocationMessage(chatId: string, location: LocationInput): Promise<MessageResult> {
@@ -391,10 +731,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       address: location.address || '',
     });
     const msg = await this.client!.sendMessage(chatId, loc);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.toMessageResult(msg);
   }
 
   async sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
@@ -411,10 +748,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, vcard, {
       parseVCards: true,
     });
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.toMessageResult(msg);
   }
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -434,10 +768,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, messageMedia, {
       sendMediaAsSticker: true,
     });
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.toMessageResult(msg);
   }
 
   async replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult> {
@@ -452,10 +783,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     const msg = await quotedMsg.reply(text);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.toMessageResult(msg);
   }
 
   async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
