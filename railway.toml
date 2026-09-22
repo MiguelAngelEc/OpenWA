@@ -1,0 +1,5 @@
+[deploy]
+healthcheckPath = "/api/health/ready"
+
+[[volumes]]
+mountPath = "/app/data"
