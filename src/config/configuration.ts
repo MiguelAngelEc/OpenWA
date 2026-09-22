@@ -252,6 +252,9 @@ export default () => ({
   webhook: {
     timeout: parseInt(process.env.WEBHOOK_TIMEOUT || '10000', 10),
     retryDelay: parseInt(process.env.WEBHOOK_RETRY_DELAY || '5000', 10),
+    // Temporary compatibility bridge for legacy n8n workflows that still match text messages as type='chat'.
+    // Internal storage, WebSocket events and automation rules keep the modern engine-neutral type='text'.
+    legacyTextTypeChat: process.env.LEGACY_WEBHOOK_TEXT_TYPE_CHAT === 'true',
     // Cap on how many matching webhooks are delivered CONCURRENTLY for one event. Without it, an event
     // matching N webhooks opens N outbound sockets at once (no per-event bound). Default 16.
     dispatchConcurrency: parseInt(process.env.WEBHOOK_DISPATCH_CONCURRENCY || '16', 10),
