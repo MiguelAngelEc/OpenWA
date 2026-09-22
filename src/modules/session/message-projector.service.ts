@@ -363,8 +363,15 @@ export class MessageProjector {
       void this.chatMediaArchive?.archive(dbMessage).catch(() => undefined);
     }
 
-    // Dispatch to webhooks with potentially modified message
-    void this.webhookService.dispatch(id, 'message.received', finalMessage);
+    // Dispatch to webhooks with potentially modified message. During migration, an operator may
+    // temporarily keep the pre-0.2.8 text token ('chat') for webhook consumers only. Internal
+    // storage, WebSocket events and automation rules remain on the modern neutral type ('text').
+    const legacyTextTypeChat = this.configService?.get<boolean>('webhook.legacyTextTypeChat', false) === true;
+    const webhookMessage: Record<string, unknown> =
+      legacyTextTypeChat && finalMessage.type === 'text'
+        ? { ...finalMessage, type: 'chat' }
+        : finalMessage;
+    void this.webhookService.dispatch(id, 'message.received', webhookMessage);
     // Autoreply rules ride the same at-most-once dispatch (the insert oracle above dedupes engine
     // re-fires) and stay fail-open like the webhook: a broken rule must never break the receive path.
     void this.automationRules?.evaluateInbound(id, finalMessage).catch(() => undefined);
