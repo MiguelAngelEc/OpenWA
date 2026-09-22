@@ -396,6 +396,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'STATUS_SEED_ON_READY',
     'STORE_EPHEMERAL_MESSAGES',
     'RESOLVE_LID_TO_PHONE',
+    'LEGACY_WEBHOOK_TEXT_TYPE_CHAT',
     'SIMULATE_TYPING',
     'SEARCH_ENABLED',
     // Read at boot by the throttler factory (app.module.ts) and CacheService with `=== 'true'`: a
