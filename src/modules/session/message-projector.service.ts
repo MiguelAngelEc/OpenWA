@@ -368,9 +368,7 @@ export class MessageProjector {
     // storage, WebSocket events and automation rules remain on the modern neutral type ('text').
     const legacyTextTypeChat = this.configService?.get<boolean>('webhook.legacyTextTypeChat', false) === true;
     const webhookMessage: Record<string, unknown> =
-      legacyTextTypeChat && finalMessage.type === 'text'
-        ? { ...finalMessage, type: 'chat' }
-        : finalMessage;
+      legacyTextTypeChat && finalMessage.type === 'text' ? { ...finalMessage, type: 'chat' } : finalMessage;
     void this.webhookService.dispatch(id, 'message.received', webhookMessage);
     // Autoreply rules ride the same at-most-once dispatch (the insert oracle above dedupes engine
     // re-fires) and stay fail-open like the webhook: a broken rule must never break the receive path.

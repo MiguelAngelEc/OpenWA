@@ -97,6 +97,7 @@ services:
       # Mirrors docker-compose.yml: flags with no dashboard route, which a .env value could not
       # otherwise reach the container at all.
       - WEBHOOK_CONTACT_DETAILS=${WEBHOOK_CONTACT_DETAILS:-}
+      - LEGACY_WEBHOOK_TEXT_TYPE_CHAT=${LEGACY_WEBHOOK_TEXT_TYPE_CHAT:-false}
       - BAILEYS_MARK_ONLINE_ON_CONNECT=${BAILEYS_MARK_ONLINE_ON_CONNECT:-}
       - BAILEYS_SYNC_FULL_HISTORY=${BAILEYS_SYNC_FULL_HISTORY:-}
       - BAILEYS_WA_VERSION=${BAILEYS_WA_VERSION:-}
