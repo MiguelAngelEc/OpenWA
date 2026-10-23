@@ -406,12 +406,7 @@ const SqliteSession = new EntitySchema<Record<string, unknown>>({
       );
     }
 
-    const stats = new StatsService(
-      ds.getRepository(Session),
-      messages,
-      { setSessionsStats: () => Promise.resolve(undefined) } as never,
-      cfg as never,
-    );
+    const stats = new StatsService(ds.getRepository(Session), messages, cfg as never);
 
     expect((await stats.getOverview()).messages.today).toEqual({ sent: 1, received: 0 });
   });
@@ -429,6 +424,26 @@ const SqliteSession = new EntitySchema<Record<string, unknown>>({
     expect(await repo.findOneBy({ id: SESSION_ID, leaseExpiresAt: LessThan(new Date()) })).toBeNull();
     const carried = await repo.findOneByOrFail({ id: SESSION_ID });
     expect(carried.leaseExpiresAt!.getTime()).toBeGreaterThanOrEqual(leaseExpiresAt.getTime());
+  });
+
+  it('re-keys a name-keyed chat state on restore over a uuid sessions.id', async () => {
+    // synchronize gives sessions.id a native uuid type, which has no `=` against the varchar key.
+    await ds.query('DELETE FROM chat_states');
+    const session = await seedSession(SESSION_ID, new Date('2026-01-01T00:00:00.000Z'));
+    const chats = ds.getRepository(ChatState);
+    await chats.save([
+      { sessionId: session.name, chatId: 'by-name@c.us', archived: true, pinned: false },
+      { sessionId: SESSION_ID, chatId: 'by-id@c.us', archived: false, pinned: true },
+    ]);
+    const archive = JSON.parse(JSON.stringify(await infra.exportData())) as { tables: MigrationTables };
+
+    expect(await infra.importData({ tables: archive.tables })).toMatchObject({ imported: true, warnings: [] });
+
+    const rows = await chats.find({ order: { chatId: 'ASC' } });
+    expect(rows.map(r => [r.chatId, r.sessionId, r.archived, r.pinned])).toEqual([
+      ['by-id@c.us', SESSION_ID, false, true],
+      ['by-name@c.us', SESSION_ID, true, false],
+    ]);
   });
 
   it('rolls back a rejected row with its real error instead of an aborted-transaction failure', async () => {

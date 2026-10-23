@@ -17,6 +17,12 @@ describe('renderTemplate', () => {
     it('leaves an unknown placeholder literal', () => {
       expect(renderTemplate('Hi {{name}}', {})).toBe('Hi {{name}}');
     });
+
+    it('never renders a member of Object.prototype for a name with no variable of its own', () => {
+      expect(renderTemplate('{{constructor}} {{toString}} {{__proto__}}', {})).toBe(
+        '{{constructor}} {{toString}} {{__proto__}}',
+      );
+    });
   });
 
   describe('legacy single-brace {name} (deprecated, still supported)', () => {

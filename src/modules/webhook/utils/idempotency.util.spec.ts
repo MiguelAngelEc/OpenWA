@@ -276,6 +276,30 @@ describe('Idempotency Utils', () => {
       );
     });
 
+    it('keys presence.update on WHAT changed, salted per occurrence', () => {
+      const at = '2026-07-20T00:00:00.000Z';
+      const data = { sessionId: 'A', chatId: '123@g.us', participants: [{ id: 'u1@lid', state: 'composing' }] };
+      const a = generateIdempotencyKey('presence.update', data, at);
+      expect(a).toMatch(/^pres_A_123@g\.us_[a-f0-9]{12}_2026-07-20T00:00:00\.000Z$/);
+      expect(generateIdempotencyKey('presence.update', data, at)).toBe(a);
+      expect(generateIdempotencyKey('presence.update', data, '2026-07-20T00:05:00.000Z')).not.toBe(a);
+      // Two participants changing in the same millisecond are two events, not one.
+      const other = { ...data, participants: [{ id: 'u2@lid', state: 'available' }] };
+      expect(generateIdempotencyKey('presence.update', other, at)).not.toBe(a);
+    });
+
+    it('keys event.response on the session + RSVP id (unique per answer, no occurrence salt needed)', () => {
+      const at = '2026-07-20T00:00:00.000Z';
+      const data = { sessionId: 'A', eventMessageId: 'EVT1', responseMessageId: 'RSVP1', response: 'going' };
+      const key = generateIdempotencyKey('event.response', data, at);
+      expect(key).toBe('rsvp_A_RSVP1');
+      expect(generateIdempotencyKey('event.response', data, '2026-07-20T01:00:00.000Z')).toBe(key);
+      // A changed answer is a new RSVP with a new id, so it is never deduped against the first.
+      const changed = { ...data, responseMessageId: 'RSVP2', response: 'not_going' };
+      expect(generateIdempotencyKey('event.response', changed, at)).not.toBe(key);
+      expect(generateIdempotencyKey('event.response', { ...data, sessionId: 'B' }, at)).not.toBe(key);
+    });
+
     it('keys call.received on the session + call id (unique per call, no occurrence salt needed)', () => {
       const at = '2026-07-20T00:00:00.000Z';
       const data = { sessionId: 'A', callId: 'CALL1', from: '628111@c.us', timestamp: 1782000000 };

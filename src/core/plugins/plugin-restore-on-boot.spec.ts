@@ -4,6 +4,7 @@ import * as path from 'path';
 import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
 import { PluginLoaderService } from './plugin-loader.service';
+import type { ShutdownService } from '../../common/services/shutdown.service';
 import { PluginStorageService } from './plugin-storage.service';
 import { HookManager } from '../hooks';
 import { PluginStatus, PluginType, type PluginManifest } from './plugin.interfaces';
@@ -140,6 +141,75 @@ describe('PluginLoaderService — restoring the operator enable decision across 
     // A plugin that cannot come back must never hold up the gateway.
     await expect(loader2.onApplicationBootstrap()).resolves.toBeUndefined();
     expect(enable).toHaveBeenCalledWith(second.id);
+  });
+
+  it('stops restoring plugins once shutdown teardown begins', async () => {
+    const second: PluginManifest = { ...manifest, id: 'ext-two', name: 'Ext Two' };
+    const secondDir = path.join(tmpDir, 'plugins', second.id);
+    fs.mkdirSync(secondDir, { recursive: true });
+    fs.writeFileSync(path.join(secondDir, 'manifest.json'), JSON.stringify(second));
+    fs.writeFileSync(path.join(secondDir, 'index.js'), 'module.exports = class {};');
+
+    const storage2 = new PluginStorageService(config);
+    const loader2 = makeLoader(storage2);
+    loader2.loadPlugin(pluginDir);
+    loader2.loadPlugin(secondDir);
+    storage2.setPluginEnabledByOperator(manifest.id, true);
+    storage2.setPluginEnabledByOperator(second.id, true);
+
+    const log = jest
+      .spyOn((loader2 as unknown as { logger: { log: (...args: unknown[]) => void } }).logger, 'log')
+      .mockImplementation(() => undefined);
+    // The gateway starts shutting down while the first plugin is being restored.
+    let destroying: Promise<void> | undefined;
+    const enable = jest.spyOn(loader2, 'enablePlugin').mockImplementation(() => {
+      destroying = loader2.onModuleDestroy();
+      return Promise.resolve();
+    });
+
+    await loader2.onApplicationBootstrap();
+    await destroying;
+
+    expect(enable).toHaveBeenCalledTimes(1);
+    expect(enable).not.toHaveBeenCalledWith(second.id);
+    // The skipped plugins are reported, so an operator can tell the restore was cut short.
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('stopped at 1 of 2'),
+      expect.objectContaining({ action: 'plugin_restore_aborted' }),
+    );
+  });
+
+  it('stops restoring plugins once the gateway starts draining, before its own module is destroyed', async () => {
+    const second: PluginManifest = { ...manifest, id: 'ext-two', name: 'Ext Two' };
+    const secondDir = path.join(tmpDir, 'plugins', second.id);
+    fs.mkdirSync(secondDir, { recursive: true });
+    fs.writeFileSync(path.join(secondDir, 'manifest.json'), JSON.stringify(second));
+    fs.writeFileSync(path.join(secondDir, 'index.js'), 'module.exports = class {};');
+
+    const storage2 = new PluginStorageService(config);
+    // The drain flag flips at the signal; PluginsModule is destroyed last, long after.
+    let draining = false;
+    const shutdown = { isShuttingDown: () => draining };
+    const loader2 = new PluginLoaderService(
+      config,
+      new HookManager(),
+      storage2,
+      {} as unknown as ModuleRef,
+      undefined,
+      shutdown as unknown as ShutdownService,
+    );
+    loader2.loadPlugin(pluginDir);
+    loader2.loadPlugin(secondDir);
+    storage2.setPluginEnabledByOperator(manifest.id, true);
+    storage2.setPluginEnabledByOperator(second.id, true);
+    const enable = jest.spyOn(loader2, 'enablePlugin').mockImplementation(() => {
+      draining = true;
+      return Promise.resolve();
+    });
+
+    await loader2.onApplicationBootstrap();
+
+    expect(enable).toHaveBeenCalledTimes(1);
   });
 
   it('does not treat the shutdown teardown as the operator disabling the plugin', async () => {

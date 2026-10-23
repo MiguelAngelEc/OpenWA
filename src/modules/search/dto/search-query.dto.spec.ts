@@ -1,6 +1,8 @@
+import { DECORATORS } from '@nestjs/swagger';
 import { validateSync } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { SearchQueryDto } from './search-query.dto';
+import { SEARCH_OFFSET_MAX, SEARCH_QUERY_MAX_LENGTH } from '../search.constants';
 
 describe('SearchQueryDto', () => {
   // Mirrors how the global ValidationPipe (transform:true + enableImplicitConversion) instantiates
@@ -32,6 +34,13 @@ describe('SearchQueryDto', () => {
   it('rejects a fractional limit or offset', () => {
     expect(validateSync(fromQuery({ q: 'hello', limit: '1.5' })).some(e => e.property === 'limit')).toBe(true);
     expect(validateSync(fromQuery({ q: 'hello', offset: '0.5' })).some(e => e.property === 'offset')).toBe(true);
+  });
+
+  it('rejects a q longer than SEARCH_QUERY_MAX_LENGTH and accepts one at the bound', () => {
+    expect(validateSync(fromQuery({ q: 'a'.repeat(SEARCH_QUERY_MAX_LENGTH) }))).toHaveLength(0);
+    expect(validateSync(fromQuery({ q: 'a'.repeat(SEARCH_QUERY_MAX_LENGTH + 1) })).some(e => e.property === 'q')).toBe(
+      true,
+    );
   });
 
   it('rejects limit < 1 (@Min(1))', () => {
@@ -67,5 +76,13 @@ describe('SearchQueryDto', () => {
   it('accepts a minimal valid query with only q', () => {
     const dto = fromQuery({ q: 'hello' });
     expect(validateSync(dto)).toHaveLength(0);
+  });
+
+  // @nestjs/swagger derives no bounds from @IsInt/@Min/@Max, so the decorator has to state them.
+  it('publishes limit and offset as bounded integers', () => {
+    const published = (key: string): unknown =>
+      Reflect.getMetadata(DECORATORS.API_MODEL_PROPERTIES, SearchQueryDto.prototype, key);
+    expect(published('limit')).toMatchObject({ type: 'integer', minimum: 1 });
+    expect(published('offset')).toMatchObject({ type: 'integer', minimum: 0, maximum: SEARCH_OFFSET_MAX });
   });
 });

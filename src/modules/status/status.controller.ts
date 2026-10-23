@@ -23,7 +23,7 @@ export class StatusController {
   @ApiOperation({ summary: 'Get all contact status updates' })
   @ApiResponse({
     status: 200,
-    description: 'Status updates visible to the session, grouped by contact.',
+    description: 'Status updates visible to the session, newest first.',
     type: StatusListResponseDto,
   })
   async getStatuses(@Param('sessionId') sessionId: string) {
@@ -47,7 +47,7 @@ export class StatusController {
   @ApiOperation({ summary: 'Stream a stored status media file' })
   @ApiResponse({
     status: 200,
-    description: 'The status image/video bytes.',
+    description: 'The status image, video or voice note (audio) bytes.',
     content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
   })
   @ApiResponse({ status: 404, description: 'No stored media (text status, omitted, or expired).' })
@@ -179,7 +179,12 @@ export class StatusController {
   @ApiResponse({ status: 200, description: 'Status deleted.', type: StatusDeletedResponseDto })
   @ApiResponse({
     status: 403,
-    description: "Key lacks OPERATOR role, or (whatsapp-web.js) the id is not one of the account's own statuses",
+    description:
+      "Key lacks OPERATOR role; on whatsapp-web.js, the id is not one of the account's own statuses; on " +
+      'Baileys, the status was not posted by this session in the last 24 hours (it was posted from the phone ' +
+      "or from another node, or before the session's engine was last created by a restart, a stop and start, " +
+      'or a reconnect the gateway runs itself), so its recipients are unknown and the revoke cannot be ' +
+      'addressed to them.',
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })

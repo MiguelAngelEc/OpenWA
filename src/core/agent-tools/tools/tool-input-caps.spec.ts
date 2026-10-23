@@ -3,6 +3,7 @@ import { validate } from 'class-validator';
 import type { MessageService } from '../../../modules/message/message.service';
 import type { GroupService } from '../../../modules/group/group.service';
 import {
+  CHAT_ID_MAX_LENGTH,
   MENTIONS_MAX,
   MESSAGE_TEXT_MAX_LENGTH,
   SendTextMessageDto,
@@ -238,5 +239,33 @@ describe('agent-tool identifiers reject an empty string', () => {
 
   it.each(idFields)('%s rejects an empty string', (_label, schema) => {
     expect(schema.safeParse('').success).toBe(false);
+  });
+});
+
+/**
+ * A chat id is stored under a btree index, which PostgreSQL cannot hold past about 2.7 KB, and the tool
+ * path calls the service directly. The REST bodies cap it; so does every tool field that names a chat.
+ */
+describe('agent-tool chat ids are capped as the REST bodies cap them', () => {
+  const chatFields = allAgentTools({} as never).flatMap(t =>
+    Object.entries((t.inputSchema as unknown as z.ZodObject<Record<string, z.ZodType>>).shape)
+      .filter(([key]) => /^(chatId|fromChatId|toChatId)$/.test(key))
+      .map(([key, schema]) => [`${t.name}.${key}`, schema] as const),
+  );
+
+  it('finds the chat id fields to check', () => {
+    expect(chatFields.map(([label]) => label)).toEqual(
+      expect.arrayContaining([
+        'MessageSendText.chatId',
+        'MessageForward.fromChatId',
+        'MessageForward.toChatId',
+        'SessionMarkChatRead.chatId',
+      ]),
+    );
+  });
+
+  it.each(chatFields)('%s accepts an id at the cap and rejects one past it', (_label, schema) => {
+    expect(schema.safeParse('x'.repeat(CHAT_ID_MAX_LENGTH)).success).toBe(true);
+    expect(schema.safeParse('x'.repeat(CHAT_ID_MAX_LENGTH + 1)).success).toBe(false);
   });
 });

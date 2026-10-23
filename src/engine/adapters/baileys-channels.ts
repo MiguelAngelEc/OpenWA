@@ -1,6 +1,7 @@
-import type { WASocket } from '@whiskeysockets/baileys';
+import type { NewsletterMetadata, WASocket } from '@whiskeysockets/baileys';
 import { Channel } from '../interfaces/whatsapp-engine.interface';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { mapServerRefusal } from './baileys-groups';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
 
@@ -45,6 +46,25 @@ export function wmexRefusalCode(error: unknown): number | undefined {
     return err.output.statusCode;
   }
   return undefined;
+}
+
+/**
+ * `thread_metadata` as newsletterMetadata actually returns it (recorded live in
+ * scripts/patch-baileys-newsletter-create.spec.js). The .d.ts types it as the flattened create shape.
+ */
+interface RawNewsletterThread {
+  name?: { text?: string } | null;
+  description?: { text?: string } | null;
+  invite?: string;
+  subscribers_count?: string;
+  verification?: 'VERIFIED' | 'UNVERIFIED';
+  creation_time?: string;
+}
+
+/** A wire number that may come as a string, or as NaN from the create parser; undefined unless finite. */
+function finiteNumber(value: number | string | undefined): number | undefined {
+  const n = typeof value === 'string' ? Number.parseInt(value, 10) : value;
+  return n !== undefined && Number.isFinite(n) ? n : undefined;
 }
 
 export class BaileysChannels {
@@ -92,14 +112,17 @@ export class BaileysChannels {
    * A channel lookup that WhatsApp refuses (an unknown id, a bad invite code) comes back as a w:mex
    * GraphQL error rather than an empty node, so a 4xx refusal is read as "no such channel", the same
    * way the group invite lookup reads one. A rate limit (429) or a timeout (408) says nothing about
-   * the channel, so it propagates, as does the deadline, which stays inside.
+   * the channel, so it answers 503, as the deadline does.
    */
   private async lookup(type: 'jid' | 'invite', key: string, operation: string) {
     try {
       return await this.bounded(this.sock().newsletterMetadata(type, key), operation);
     } catch (error) {
       const code = wmexRefusalCode(error);
-      if (code !== undefined && code >= 400 && code < 500 && code !== 408 && code !== 429) {
+      if (code === 408 || code === 429) {
+        throw new EngineTransportError(`WhatsApp rate-limited or timed out ${operation} (code ${code})`);
+      }
+      if (code !== undefined && code >= 400 && code < 500) {
         return null;
       }
       throw error;
@@ -110,13 +133,18 @@ export class BaileysChannels {
    * Deliberately NOT bounded, unlike every other call here: creating a channel is non-idempotent,
    * and 503 is a backpressure status the Go SDK retries three times for POST (sdk/go/retry.go).
    * A deadline abandons without cancelling, so a slow-but-succeeding create could leave duplicates.
+   * An unanswered query therefore still surfaces opaquely rather than as something retryable, and so
+   * does WA code 408: a server timeout does not say whether the channel was created.
    */
   async createChannel(name: string, description?: string): Promise<Channel> {
     this.host.ensureReady();
     const meta = await mapServerRefusal(
       'Creating the channel',
       () => this.sock().newsletterCreate(name, description),
-      wmexRefusalCode,
+      error => {
+        const code = wmexRefusalCode(error);
+        return code === 408 ? undefined : code;
+      },
     );
     return this.toChannel(meta);
   }
@@ -192,27 +220,31 @@ export class BaileysChannels {
     );
   }
 
-  /** Map a Baileys NewsletterMetadata to the neutral Channel shape (optionals only when present). */
-  private toChannel(meta: {
-    id: string;
-    name: string;
-    description?: string;
-    invite?: string;
-    creation_time?: number;
-    subscribers?: number;
-    picture?: { url?: string };
-    verification?: string;
-    thread_metadata?: { creation_time?: number };
-  }): Channel {
-    const createdAt = meta.creation_time ?? meta.thread_metadata?.creation_time;
+  /**
+   * Map a channel to the neutral Channel shape (optionals only when present).
+   *
+   * Two shapes arrive here. newsletterCreate flattens its response (parseNewsletterCreateResponse),
+   * but newsletterMetadata returns the raw GraphQL node untouched: fields nested under
+   * `thread_metadata`, name and description as `{ text }`, counts and timestamps as strings. The
+   * flat fields are read first and the nested ones fill the gaps. The flat parse uses parseInt, so
+   * a missing number arrives as NaN and is dropped rather than serialized as null.
+   *
+   * No `picture`: neither shape carries a URL, only a CDN direct path.
+   */
+  private toChannel(meta: NewsletterMetadata): Channel {
+    const thread = meta.thread_metadata as RawNewsletterThread | undefined;
+    const description = meta.description ?? thread?.description?.text;
+    const invite = meta.invite ?? thread?.invite;
+    const subscriberCount = finiteNumber(meta.subscribers) ?? finiteNumber(thread?.subscribers_count);
+    const verification = meta.verification ?? thread?.verification;
+    const createdAt = finiteNumber(meta.creation_time) ?? finiteNumber(thread?.creation_time);
     return {
       id: meta.id,
-      name: meta.name,
-      ...(meta.description ? { description: meta.description } : {}),
-      ...(meta.invite ? { inviteCode: meta.invite } : {}),
-      ...(meta.subscribers !== undefined ? { subscriberCount: meta.subscribers } : {}),
-      ...(meta.picture?.url ? { picture: meta.picture.url } : {}),
-      ...(meta.verification ? { verified: meta.verification === 'VERIFIED' } : {}),
+      name: meta.name ?? thread?.name?.text ?? '',
+      ...(description ? { description } : {}),
+      ...(invite ? { inviteCode: invite } : {}),
+      ...(subscriberCount !== undefined ? { subscriberCount } : {}),
+      ...(verification ? { verified: verification === 'VERIFIED' } : {}),
       ...(createdAt !== undefined ? { createdAt } : {}),
     };
   }

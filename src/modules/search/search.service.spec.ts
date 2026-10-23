@@ -1,7 +1,7 @@
-import { NotImplementedException } from '@nestjs/common';
+import { BadRequestException, NotImplementedException } from '@nestjs/common';
 import { SearchService } from './search.service';
 import { SearchProviderRegistry } from './search-provider.registry';
-import { SEARCH_DEFAULT_LIMIT, SEARCH_LIMIT_MAX, SEARCH_OFFSET_MAX } from './search.constants';
+import { SEARCH_DEFAULT_LIMIT, SEARCH_LIMIT_MAX, SEARCH_OFFSET_MAX, SEARCH_TERMS_MAX } from './search.constants';
 import type { SearchProvider, SearchResults } from './search.types';
 
 function mkProvider(id: string, search: SearchProvider['search']): SearchProvider {
@@ -38,6 +38,49 @@ describe('SearchService', () => {
     // A smuggled `sessionIds` in the query body must be overwritten by the authoritative caller scope.
     await svc.search({ q: 'x', sessionIds: ['sneaky'] }, ['s1']);
     expect(search).toHaveBeenCalledWith(expect.objectContaining({ sessionIds: ['s1'] }));
+  });
+
+  it('injects the caller chat scope and does not let a caller override chatIds either', async () => {
+    const reg = new SearchProviderRegistry();
+    const search = jest.fn().mockResolvedValue(emptyResults);
+    reg.register(mkProvider('builtin-fts', search));
+    const svc = new SearchService(reg);
+    // The lid-expanded allowlist arrives from ChatScopeService via the controller; a smuggled
+    // `chatIds` must be overwritten exactly like sessionIds.
+    await svc.search({ q: 'x', chatIds: ['sneaky'] }, undefined, ['111@c.us', '111@lid']);
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ chatIds: ['111@c.us', '111@lid'] }));
+  });
+
+  it('refuses a query of more than SEARCH_TERMS_MAX words before any provider runs it', async () => {
+    const reg = new SearchProviderRegistry();
+    const search = jest.fn().mockResolvedValue(emptyResults);
+    reg.register(mkProvider('builtin-fts', search));
+    const svc = new SearchService(reg);
+    const words = (n: number): string => Array.from({ length: n }, (_, i) => `w${i}`).join(' ');
+
+    await expect(svc.search({ q: words(SEARCH_TERMS_MAX + 1) })).rejects.toBeInstanceOf(BadRequestException);
+    expect(search).not.toHaveBeenCalled();
+
+    await svc.search({ q: words(SEARCH_TERMS_MAX) });
+    // A word said many times is one word.
+    await svc.search({ q: Array.from({ length: 300 }, () => 'hello').join(' ') });
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it('counts the words inside a token the way the index does, so punctuation cannot hide them', async () => {
+    const reg = new SearchProviderRegistry();
+    const search = jest.fn().mockResolvedValue(emptyResults);
+    reg.register(mkProvider('builtin-fts', search));
+    const svc = new SearchService(reg);
+    const joined = (n: number, sep: string): string => Array.from({ length: n }, () => 'a').join(sep);
+
+    for (const sep of ['.', '-', '_', '@', '\u1CF2']) {
+      await expect(svc.search({ q: joined(SEARCH_TERMS_MAX + 1, sep) })).rejects.toBeInstanceOf(BadRequestException);
+    }
+    expect(search).not.toHaveBeenCalled();
+
+    await svc.search({ q: joined(SEARCH_TERMS_MAX, '.') });
+    expect(search).toHaveBeenCalledTimes(1);
   });
 
   it('clamps an excessive limit to SEARCH_LIMIT_MAX before it reaches any provider', async () => {

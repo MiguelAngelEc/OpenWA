@@ -1,5 +1,6 @@
 import { NotFoundException } from '@nestjs/common';
 import { type Client } from 'whatsapp-web.js';
+import { mapWwebjsMessageType } from './message-mapper';
 import { Label, ChatSummary } from '../interfaces/whatsapp-engine.interface';
 import { GroupChat, BusinessClient } from '../types/whatsapp-web-js.types';
 import { isChannelJid, chatKind } from '../identity/wa-id';
@@ -82,6 +83,7 @@ export class WwebjsLabels {
         kind: chatKind(id),
         unreadCount: chat.unreadCount || 0,
         timestamp: chat.timestamp || 0,
+        lastMessageType: chat.lastMessage ? mapWwebjsMessageType(chat.lastMessage.type) : undefined,
         archived: Boolean(chat.archived),
         pinned: Boolean(chat.pinned),
         muted: Boolean(chat.isMuted),
@@ -189,6 +191,11 @@ export class WwebjsLabels {
       }
       throw error;
     }
-    this.host.logger.log(`${add ? 'Added' : 'Removed'} label ${labelId} ${add ? 'to' : 'from'} chat ${chatId}`);
+    // The page drops an id it does not know and resolves, so the write left the chat unchanged. Checked
+    // after the write, not before, so a personal account (no labels at all) still gets the LT01 422.
+    if (add && !(await this.getLabels()).some(label => label.id === labelId)) {
+      throw new LabelNotFoundError(labelId);
+    }
+    this.host.logger.debug(add ? 'Added label to chat' : 'Removed label from chat', { labelId, chatId });
   }
 }

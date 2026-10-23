@@ -24,13 +24,16 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  # The SDK's dev dependencies (phpunit and what it pulls in) execute on this job's runner. It holds no
+  # secret, and the job that does (release, below) takes a checkout of its own and installs nothing, so
+  # nothing those packages write reaches the push that carries the mirror token.
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0 # full history is required for `git subtree split`
-          persist-credentials: false # stop the GITHUB_TOKEN extraheader from shadowing the PAT in the push URL
+          persist-credentials: false
 
       # Guards are textual and secret-free, so a misconfigured release fails BEFORE anything is
       # pushed. Mirrors java/js/python-sdk-release.yml.
@@ -79,6 +82,29 @@ jobs:
           composer install --no-interaction --no-progress
           ./vendor/bin/phpunit
 
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0 # full history is required for `git subtree split`
+          persist-credentials: false # stop the GITHUB_TOKEN extraheader from shadowing the PAT in the push URL
+
+      # The job that holds the token refuses any other ref itself, whatever ran before it.
+      - name: Guard - ref must be a php-sdk-v* release tag
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          case "$REF" in
+            refs/tags/php-sdk-v*) ;;
+            *)
+              echo "::error::This workflow publishes to Packagist and must run from a php-sdk-v* tag (got '$REF')."
+              exit 1
+              ;;
+          esac
+
       - name: Tag the mirror repo
         env:
           SPLIT_TOKEN: ${{ secrets.PHP_SDK_SPLIT_TOKEN }}
@@ -111,5 +137,7 @@ jobs:
           echo "Split SHA: $SPLIT_SHA"
           # Tag without the `v` prefix, matching the existing 0.1.0 tag on the mirror. Composer accepts
           # both, but mixing the two in one repository makes the version list read as two series.
-          git push "$MIRROR" "${SPLIT_SHA}:refs/tags/${VERSION}"
+          # Hooks off: nothing in this job runs project code, so none are expected, and none may run with
+          # the token in the environment of this push.
+          git -c core.hooksPath=/dev/null push "$MIRROR" "${SPLIT_SHA}:refs/tags/${VERSION}"
           echo "Tagged rmyndharis/openwa-php ${VERSION} -> ${SPLIT_SHA}"
