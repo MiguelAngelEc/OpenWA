@@ -238,6 +238,7 @@ services:
       # BAILEYS_MARK_ONLINE_ON_CONNECT is the one that bites: its default silences push
       # notifications on the paired phone for as long as the gateway is connected (#871).
       - WEBHOOK_CONTACT_DETAILS=${WEBHOOK_CONTACT_DETAILS:-}
+      - LEGACY_WEBHOOK_TEXT_TYPE_CHAT=${LEGACY_WEBHOOK_TEXT_TYPE_CHAT:-false}
       - BAILEYS_MARK_ONLINE_ON_CONNECT=${BAILEYS_MARK_ONLINE_ON_CONNECT:-}
       - BAILEYS_SYNC_FULL_HISTORY=${BAILEYS_SYNC_FULL_HISTORY:-}
       - BAILEYS_WA_VERSION=${BAILEYS_WA_VERSION:-}

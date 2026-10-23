@@ -1,7 +1,7 @@
 /**
  * Post-install hook (npm `postinstall`).
  *
- * Eleven conditional steps, each skipped when its target is absent so the hook is a no-op where the
+ * Twelve conditional steps, each skipped when its target is absent so the hook is a no-op where the
  * piece is missing (the Docker builder stage copies package*.json long before any source):
  *
  *   1. `npm ci` inside dashboard/ when dashboard/ exists — the dashboard carries its own lockfile and
@@ -29,11 +29,13 @@
  *      group-description job call with the options object the page now takes, gated the same way.
  *   9. `node scripts/patch-wwebjs-media-id.js --best-effort` when present, stripping the media
  *      model's private id from the outgoing message so media sends work again, gated the same way.
- *  10. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *  10. `node scripts/patch-wwebjs-download-mimetype.js --best-effort` when present, passing the
+ *      mimetype required for inbound media downloads.
+ *  11. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  11. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 10-11 are the Baileys patches, so a Baileys-only install
- *      runs those and skips 2-9.
+ *  12. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *      newsletter-create parse fix. Steps 11-12 are the Baileys patches, so a Baileys-only install
+ *      runs those and skips 2-10.
  *
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
  * (scripts/postinstall.spec.js, node:test) exercises every branch without a real npm run.
@@ -148,6 +150,15 @@ function planSteps(root, env = process.env) {
       name: 'whatsapp-web.js media send repair (scripts/patch-wwebjs-media-id.js --best-effort)',
       command: process.execPath,
       args: [mediaIdPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const downloadMimetypePatcher = path.join(root, 'scripts', 'patch-wwebjs-download-mimetype.js');
+  if (fs.existsSync(downloadMimetypePatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js media download mimetype (scripts/patch-wwebjs-download-mimetype.js --best-effort)',
+      command: process.execPath,
+      args: [downloadMimetypePatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }
